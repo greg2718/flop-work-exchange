@@ -56,6 +56,21 @@ def test_cli_list_jobs_and_verify_receipt(
     assert verification["ok"] is True
 
 
+def test_cli_doctor_and_live_demo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["doctor"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is True
+    assert report["payment_mode"] == "paper"
+    assert report["adapter_modes"]["scout"] == "stub"
+    assert main(["live-demo", "--state-dir", str(tmp_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["receipt"]["payment_mode"] == "paper"
+    assert payload["adapter_kinds"]["scout"] == "stub"
+
+
 def test_help_lists_required_commands() -> None:
     import io
     from contextlib import redirect_stdout
@@ -77,5 +92,7 @@ def test_help_lists_required_commands() -> None:
         "settle",
         "show-receipt",
         "demo",
+        "doctor",
+        "live-demo",
     ):
         assert command in text

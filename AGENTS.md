@@ -45,6 +45,18 @@ Rules for Codex or any coding agent modifying this repo:
     - https://technocore.chat/llms.txt
     - https://technocore.chat/auth.md
     - https://technocore.chat/patterns.md
+15. Go-live phase 1 is paper ops only: wire local Scout/Bench/Router/Sentinel
+    adapters behind the existing stub interfaces. Stubs remain the default for
+    CI/offline. Local adapters are selected via config/env (`FLOP_WX_*_MODE=local`).
+16. Local adapters must fail closed with `AdapterError` when the sibling backend
+    is missing. Never return stub success while labeling the result as live.
+17. Local Bench must use an isolated temp `--state-dir` and must not pass
+    `--allow-local-exec` unless `bench_allow_local_exec` / `FLOP_WX_BENCH_ALLOW_LOCAL_EXEC`
+    is explicitly true (default false). Generated specs stay passive.
+18. Local Sentinel must import `flop_sentinel` (optional extra/`FLOP_WX_SENTINEL_PATH`)
+    and must not copy attacker/artifact text into findings.
+19. Do not treat local adapter wiring as a payment go-live. Official faucet and
+    payment endpoints still do not exist.
 
 Future Technocore signing compatibility payload:
 

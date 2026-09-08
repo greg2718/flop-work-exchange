@@ -22,6 +22,10 @@ dev = [
     "ruff==0.16.5",
     "types-PyYAML>=6.0,<7",
 ]
+live = [
+    # flop_sentinel is unpublished. Install from a local checkout, e.g.:
+    #   pip install -e ~/dev/flop_sentinel
+]
 
 [project.scripts]
 flop-work-exchange = "flop_work_exchange.cli:main"
@@ -48,3 +52,6 @@ packages = ["flop_work_exchange"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "live: optional tests that invoke local sibling agents (skipped by default)",
+]

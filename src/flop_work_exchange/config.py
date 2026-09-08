@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import os
+import sys
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -18,6 +20,7 @@ from flop_work_exchange.exceptions import ValidationError
 
 PaymentMode = Literal["paper"]
 OperatorRelationship = Literal["independent", "same_operator", "related", "unknown"]
+AdapterMode = Literal["stub", "local"]
 
 DEFAULT_FEES = {
     "job_posting_micro": 100_000,
@@ -53,6 +56,74 @@ class FeeSchedule:
         )
 
 
+def _optional_path(value: Any) -> Path | None:
+    if value is None or value == "":
+        return None
+    return Path(str(value)).expanduser()
+
+
+def _adapter_mode(value: Any, label: str) -> AdapterMode:
+    mode = str(value or "stub")
+    if mode not in {"stub", "local"}:
+        raise ValidationError(f"{label} must be stub or local")
+    return mode  # type: ignore[return-value]
+
+
+def _env_flag(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class AdapterConfig:
+    """Stub vs local sibling-agent wiring. Stubs are the CI/offline default."""
+
+    scout_mode: AdapterMode = "stub"
+    bench_mode: AdapterMode = "stub"
+    router_mode: AdapterMode = "stub"
+    sentinel_mode: AdapterMode = "stub"
+    python: str = field(default_factory=lambda: sys.executable)
+    scout_repo: Path | None = None
+    scout_script: Path | None = None
+    scout_state_dir: Path | None = None
+    scout_db: Path | None = None
+    scout_evidence_jsonl: Path | None = None
+    bench_cli: str | None = None
+    bench_repo: Path | None = None
+    bench_allow_local_exec: bool = False
+    router_repo: Path | None = None
+    router_script: Path | None = None
+    router_db: Path | None = None
+    sentinel_path: Path | None = None
+    timeout_seconds: float = 30.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scout_mode": self.scout_mode,
+            "bench_mode": self.bench_mode,
+            "router_mode": self.router_mode,
+            "sentinel_mode": self.sentinel_mode,
+            "python": self.python,
+            "scout_repo": str(self.scout_repo) if self.scout_repo else None,
+            "scout_script": str(self.scout_script) if self.scout_script else None,
+            "scout_state_dir": str(self.scout_state_dir) if self.scout_state_dir else None,
+            "scout_db": str(self.scout_db) if self.scout_db else None,
+            "scout_evidence_jsonl": (
+                str(self.scout_evidence_jsonl) if self.scout_evidence_jsonl else None
+            ),
+            "bench_cli": self.bench_cli,
+            "bench_repo": str(self.bench_repo) if self.bench_repo else None,
+            "bench_allow_local_exec": self.bench_allow_local_exec,
+            "router_repo": str(self.router_repo) if self.router_repo else None,
+            "router_script": str(self.router_script) if self.router_script else None,
+            "router_db": str(self.router_db) if self.router_db else None,
+            "sentinel_path": str(self.sentinel_path) if self.sentinel_path else None,
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+
 @dataclass(frozen=True)
 class PolicyConfig:
     allow_same_operator_deals: bool = True
@@ -75,6 +146,7 @@ class ExchangeConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     asset: str = "FLOP"
     micro_per_flop: int = 1_000_000
+    adapters: AdapterConfig = field(default_factory=AdapterConfig)
 
     def resolved_state_dir(self) -> Path:
         return assert_isolated_state_dir(self.state_dir)
@@ -153,12 +225,93 @@ def config_from_mapping(state_dir: Path, raw: dict[str, Any]) -> ExchangeConfig:
         known_family_dids=known,
         operator_group=str(raw.get("operator_group", EXCHANGE_OPERATOR_GROUP)),
         asset=str(raw.get("asset", "FLOP")),
+        adapters=overlay_adapter_env(adapter_config_from_mapping(raw.get("adapters"))),
     )
 
 
 def load_config(state_dir: Path, config_path: Path | None = None) -> ExchangeConfig:
     path = config_path or default_fee_config_path()
     return config_from_mapping(state_dir, load_mapping(path))
+
+
+def adapter_config_from_mapping(raw: Any | None) -> AdapterConfig:
+    if raw is None:
+        return AdapterConfig()
+    mapping = _require_mapping(raw, "adapters")
+    timeout_raw = mapping.get("timeout_seconds", 30.0)
+    try:
+        timeout = float(timeout_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("adapters.timeout_seconds must be a number") from exc
+    return AdapterConfig(
+        scout_mode=_adapter_mode(mapping.get("scout_mode", "stub"), "scout_mode"),
+        bench_mode=_adapter_mode(mapping.get("bench_mode", "stub"), "bench_mode"),
+        router_mode=_adapter_mode(mapping.get("router_mode", "stub"), "router_mode"),
+        sentinel_mode=_adapter_mode(mapping.get("sentinel_mode", "stub"), "sentinel_mode"),
+        python=str(mapping.get("python") or sys.executable),
+        scout_repo=_optional_path(mapping.get("scout_repo")),
+        scout_script=_optional_path(mapping.get("scout_script")),
+        scout_state_dir=_optional_path(mapping.get("scout_state_dir")),
+        scout_db=_optional_path(mapping.get("scout_db")),
+        scout_evidence_jsonl=_optional_path(mapping.get("scout_evidence_jsonl")),
+        bench_cli=str(mapping["bench_cli"]) if mapping.get("bench_cli") else None,
+        bench_repo=_optional_path(mapping.get("bench_repo")),
+        bench_allow_local_exec=bool(mapping.get("bench_allow_local_exec", False)),
+        router_repo=_optional_path(mapping.get("router_repo")),
+        router_script=_optional_path(mapping.get("router_script")),
+        router_db=_optional_path(mapping.get("router_db")),
+        sentinel_path=_optional_path(mapping.get("sentinel_path")),
+        timeout_seconds=timeout,
+    )
+
+
+def adapter_config_from_env() -> AdapterConfig:
+    return overlay_adapter_env(AdapterConfig())
+
+
+def overlay_adapter_env(base: AdapterConfig) -> AdapterConfig:
+    """Environment variables override file/config defaults. Stubs remain default."""
+    updates: dict[str, Any] = {}
+    for field_name, env_name in (
+        ("scout_mode", "FLOP_WX_SCOUT_MODE"),
+        ("bench_mode", "FLOP_WX_BENCH_MODE"),
+        ("router_mode", "FLOP_WX_ROUTER_MODE"),
+        ("sentinel_mode", "FLOP_WX_SENTINEL_MODE"),
+    ):
+        raw = os.environ.get(env_name)
+        if raw:
+            updates[field_name] = _adapter_mode(raw, env_name)
+    if os.environ.get("FLOP_WX_PYTHON"):
+        updates["python"] = os.environ["FLOP_WX_PYTHON"]
+    path_envs = {
+        "scout_repo": "FLOP_WX_SCOUT_REPO",
+        "scout_script": "FLOP_WX_SCOUT_SCRIPT",
+        "scout_state_dir": "FLOP_WX_SCOUT_STATE_DIR",
+        "scout_db": "FLOP_WX_SCOUT_DB",
+        "scout_evidence_jsonl": "FLOP_WX_SCOUT_EVIDENCE_JSONL",
+        "bench_repo": "FLOP_WX_BENCH_REPO",
+        "router_repo": "FLOP_WX_ROUTER_REPO",
+        "router_script": "FLOP_WX_ROUTER_SCRIPT",
+        "router_db": "FLOP_WX_ROUTER_DB",
+        "sentinel_path": "FLOP_WX_SENTINEL_PATH",
+    }
+    for field_name, env_name in path_envs.items():
+        raw = os.environ.get(env_name)
+        if raw:
+            updates[field_name] = _optional_path(raw)
+    if not updates.get("scout_state_dir") and os.environ.get("FLOP_SCOUT_STATE_DIR"):
+        updates["scout_state_dir"] = _optional_path(os.environ["FLOP_SCOUT_STATE_DIR"])
+    if os.environ.get("FLOP_WX_BENCH_CLI"):
+        updates["bench_cli"] = os.environ["FLOP_WX_BENCH_CLI"]
+    allow_exec = _env_flag("FLOP_WX_BENCH_ALLOW_LOCAL_EXEC")
+    if allow_exec is not None:
+        updates["bench_allow_local_exec"] = allow_exec
+    if os.environ.get("FLOP_WX_ADAPTER_TIMEOUT"):
+        try:
+            updates["timeout_seconds"] = float(os.environ["FLOP_WX_ADAPTER_TIMEOUT"])
+        except ValueError as exc:
+            raise ValidationError("FLOP_WX_ADAPTER_TIMEOUT must be a number") from exc
+    return replace(base, **updates) if updates else base
 
 
 def write_resolved_config(state_dir: Path, config: ExchangeConfig) -> None:
@@ -189,5 +342,6 @@ def write_resolved_config(state_dir: Path, config: ExchangeConfig) -> None:
             "allow_self_deals": config.policy.allow_self_deals,
             "treat_unknown_as_independent": config.policy.treat_unknown_as_independent,
         },
+        "adapters": config.adapters.to_dict(),
     }
     atomic_write_json(state_dir / "config.json", payload)

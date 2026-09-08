@@ -3,10 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from flop_work_exchange.adapters.bench import StubBenchAdapter
-from flop_work_exchange.adapters.router import StubRouterAdapter
-from flop_work_exchange.adapters.scout import StubScoutAdapter
-from flop_work_exchange.adapters.sentinel import StubSentinelAdapter
+from flop_work_exchange.adapters import BenchAdapter, RouterAdapter, ScoutAdapter, SentinelAdapter
+from flop_work_exchange.adapters.factory import resolve_adapters
 from flop_work_exchange.adapters.settlement import PaperSettlement, TestnetSettlement
 from flop_work_exchange.adapters.tclk import StubTclkAdapter
 from flop_work_exchange.amounts import micro_to_flop_string, parse_flop_to_micro
@@ -59,20 +57,21 @@ class WorkExchange:
         self,
         config: ExchangeConfig,
         *,
-        scout: StubScoutAdapter | None = None,
-        router: StubRouterAdapter | None = None,
-        sentinel: StubSentinelAdapter | None = None,
-        bench: StubBenchAdapter | None = None,
+        scout: ScoutAdapter | None = None,
+        router: RouterAdapter | None = None,
+        sentinel: SentinelAdapter | None = None,
+        bench: BenchAdapter | None = None,
         tclk: StubTclkAdapter | None = None,
     ) -> None:
         self.config = config
         self.store = ExchangeStore(config.resolved_state_dir())
         self.store.initialize()
         write_resolved_config(self.store.state_dir, config)
-        self.scout = scout or StubScoutAdapter()
-        self.router = router or StubRouterAdapter()
-        self.sentinel = sentinel or StubSentinelAdapter()
-        self.bench = bench or StubBenchAdapter()
+        resolved = resolve_adapters(config.adapters)
+        self.scout = scout if scout is not None else resolved.scout
+        self.router = router if router is not None else resolved.router
+        self.sentinel = sentinel if sentinel is not None else resolved.sentinel
+        self.bench = bench if bench is not None else resolved.bench
         self.tclk = tclk or StubTclkAdapter()
         if config.settlement_backend == "testnet":
             self.settlement: PaperSettlement | TestnetSettlement = TestnetSettlement()

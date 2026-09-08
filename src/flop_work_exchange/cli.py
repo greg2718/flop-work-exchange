@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from flop_work_exchange import __version__
-from flop_work_exchange.config import load_config
+from flop_work_exchange.config import adapter_config_from_env, load_config
 from flop_work_exchange.constants import DEFAULT_PRODUCTION_STATE
 from flop_work_exchange.demo import run_demo
 from flop_work_exchange.exceptions import WorkExchangeError
@@ -19,6 +19,7 @@ from flop_work_exchange.identity import (
     create_test_identity,
     load_identity_meta,
 )
+from flop_work_exchange.ops import doctor, run_live_demo
 from flop_work_exchange.receipts import verify_receipt
 
 
@@ -122,6 +123,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional temp/state dir; created if omitted",
     )
+    live_demo = sub.add_parser(
+        "live-demo",
+        help="Paper job preferring local Scout/Bench/Router/Sentinel adapters",
+    )
+    live_demo.add_argument(
+        "--state-dir",
+        dest="demo_state_dir",
+        type=Path,
+        default=None,
+        help="Optional temp/state dir; created if omitted",
+    )
+    doc = sub.add_parser(
+        "doctor",
+        help="Check adapter modes, paths, identity, and state isolation",
+    )
+    doc.add_argument(
+        "--state-dir",
+        dest="doctor_state_dir",
+        type=Path,
+        default=None,
+        help="Optional state dir to inspect (not created)",
+    )
     return parser
 
 
@@ -143,6 +166,23 @@ def _dispatch(args: argparse.Namespace) -> int:
         result = run_demo(Path(state_dir))
         _print_json(result)
         return 0 if result.get("verification", {}).get("ok") else 2
+
+    if args.cmd == "live-demo":
+        state_dir = args.demo_state_dir or args.state_dir
+        if state_dir is None:
+            state_dir = Path(tempfile.mkdtemp(prefix="flop-work-exchange-live-demo-"))
+        result = run_live_demo(Path(state_dir), adapter_config=adapter_config_from_env())
+        _print_json(result)
+        return 0 if result.get("verification", {}).get("ok") else 2
+
+    if args.cmd == "doctor":
+        state_dir = args.doctor_state_dir or args.state_dir
+        report = doctor(
+            state_dir=Path(state_dir) if state_dir is not None else None,
+            adapter_config=adapter_config_from_env(),
+        )
+        _print_json(report)
+        return 0 if report.get("ok") else 1
 
     if args.cmd == "identity":
         state_dir = _require_state_dir(args)

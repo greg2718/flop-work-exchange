@@ -18,6 +18,22 @@ ROUTER_STATE = Path.home() / ".flop_agents" / "router"
 SENTINEL_STATE = Path.home() / ".flop_agents" / "sentinel"
 LEGACY_SCOUT_STATE = Path.home() / ".flop_scout"
 
+# Greg's local Mac checkouts (paper ops only; not payment rails).
+DEFAULT_DEV_ROOT = Path.home() / "dev"
+MAC_SCOUT_REPO = DEFAULT_DEV_ROOT / "flop_scout_v02"
+MAC_BENCH_REPO = DEFAULT_DEV_ROOT / "flop_bench"
+MAC_ROUTER_REPO = DEFAULT_DEV_ROOT / "flop-router"
+MAC_SENTINEL_REPO = DEFAULT_DEV_ROOT / "flop_sentinel"
+
+SCOUT_EVIDENCE_FEED_CLI = (
+    "python flop_scout.py evidence feed --since-id 0 --format jsonl"
+)
+ROUTER_DECISION_CLI = (
+    "python router.py decision create <task> --output <file> "
+    "--job-id <id> --job-proto flop-work-exchange.job.v0.1 "
+    "--verification-mode OBJECTIVE_BENCH --asset FLOP --max-amount <micro>"
+)
+
 KNOWN_FAMILY_AGENTS: tuple[dict[str, str], ...] = (
     {"name": "FLOP Scout", "did": SCOUT_DID},
     {"name": "FLOP Bench", "did": BENCH_DID},
