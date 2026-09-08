@@ -469,6 +469,8 @@ adapters:
     assert env_report["ok"] is True
     assert env_report["adapter_modes"]["scout"] == "stub"
 
+    monkeypatch.delenv("FLOP_WX_SCOUT_MODE", raising=False)
+    monkeypatch.delenv("FLOP_WX_ROUTER_MODE", raising=False)
     example = Path("examples/live-ops.yaml")
     example_cfg = load_adapter_config(example)
     assert example_cfg.scout_mode == "local"

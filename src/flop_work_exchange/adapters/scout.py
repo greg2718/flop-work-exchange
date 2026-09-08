@@ -34,6 +34,7 @@ def candidates_from_records(
     Ranked by evidence count (desc), then DID. Output is capped.
     """
     grouped: dict[str, list[str]] = {}
+    counts: dict[str, int] = {}
     for line_no, record in enumerate(records, start=1):
         did = record.get("did") or record.get("sender_did")
         if not isinstance(did, str) or not is_valid_ed25519_did(did):
@@ -42,7 +43,12 @@ def candidates_from_records(
         ids = grouped.setdefault(did, [])
         if evidence_id not in ids:
             ids.append(evidence_id)
-    ranked = sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
+        hint = record.get("evidence_count")
+        if isinstance(hint, int) and hint > counts.get(did, 0):
+            counts[did] = hint
+    for did, ids in grouped.items():
+        counts.setdefault(did, len(ids))
+    ranked = sorted(grouped.items(), key=lambda item: (-counts[item[0]], item[0]))
     cap = max(1, limit)
     candidates: list[WorkerCandidate] = []
     for did, evidence_ids in ranked[:cap]:
@@ -63,11 +69,13 @@ def cap_worker_candidates(
     candidates: Iterable[WorkerCandidate],
     limit: int = DEFAULT_SCOUT_CANDIDATE_LIMIT,
 ) -> list[WorkerCandidate]:
-    """Keep top-N candidates by evidence count. Never dump a warehouse."""
-    ranked = sorted(candidates, key=lambda item: (-len(item.evidence_ids), item.did))
+    """Keep top-N candidates. Preserve adapter order when already within the cap."""
+    items = list(candidates)
     cap = max(1, limit)
+    if len(items) > cap:
+        items = sorted(items, key=lambda item: (-len(item.evidence_ids), item.did))[:cap]
     out: list[WorkerCandidate] = []
-    for item in ranked[:cap]:
+    for item in items[:cap]:
         out.append(
             WorkerCandidate(
                 did=item.did,
@@ -328,10 +336,20 @@ class LocalScoutAdapter:
                     evid_rows = []
                 if evid_rows:
                     for evid in evid_rows:
-                        records.append({"did": did, "evidence_id": evid["evidence_id"]})
+                        records.append(
+                            {
+                                "did": did,
+                                "evidence_id": evid["evidence_id"],
+                                "evidence_count": int(row["evidence_count"]),
+                            }
+                        )
                 else:
                     records.append(
-                        {"did": did, "evidence_id": f"count-{row['evidence_count']}"}
+                        {
+                            "did": did,
+                            "evidence_id": f"count-{row['evidence_count']}",
+                            "evidence_count": int(row["evidence_count"]),
+                        }
                     )
         finally:
             conn.close()
