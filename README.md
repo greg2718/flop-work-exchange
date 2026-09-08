@@ -232,6 +232,9 @@ a public clone target). Real contract:
 - Policy: `flop_sentinel.policy.decide(findings, provenance, affiliation, *,
   detector_error, oversized, detector_versions, artifact_sha256)`.
 - `provenance` / `affiliation` are `flop_sentinel.models` enums, not dicts.
+  Paper/local artifacts map to `Provenance.UNSIGNED` (unsigned paper jobs, not
+  a made-up `LOCAL` token). Affiliation uses a real `Affiliation` member
+  (`UNKNOWN` / `FAMILY` / `SAME_OPERATOR`, …). Unknown tokens fail closed.
 - `policy` / `detectors` / `models` are submodules — import them; do not use
   `getattr(flop_sentinel, "policy")` (empty `__init__.py` does not re-export).
 - Mapped `Verdict` → `ALLOW` / `REJECT` / `REVIEW` with **rule ids only**.
@@ -243,7 +246,9 @@ Verify on Mac after `pip install -e ~/dev/flop_sentinel`:
 python -m flop_work_exchange --config examples/live-ops.yaml doctor
 ```
 
-`adapter_sentinel` should report `ok=true`.
+`adapter_sentinel` should report `ok=true`. Then `live-demo` should complete
+under paper settlement (`payment_mode=paper`, `settlement_execution=DISABLED`).
+Paper artifacts are passed to Sentinel as `Provenance.UNSIGNED` (not `LOCAL`).
 
 ### Doctor and live-demo
 

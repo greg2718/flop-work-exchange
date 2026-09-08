@@ -54,14 +54,13 @@ _DECISION_MAP = {
 _HIGH_RISK = {"high", "critical", "severe", "reject"}
 _MEDIUM_RISK = {"medium", "moderate", "review"}
 _LOW_RISK = {"low", "info", "informational", "none", "allow"}
-_PROVENANCE_NAMES = (
-    "LOCAL",
-    "WORK_EXCHANGE",
-    "INTERNAL",
-    "EXCHANGE",
-    "SYNTHETIC",
-    "PAPER",
-    "USER",
+# Paper-FLOP artifacts are local/unsigned paper jobs, not on-chain signed
+# receipts. Map onto a real flop_sentinel.models.Provenance member.
+# Do not invent a 'LOCAL' token — that is not in the library enum.
+_PAPER_PROVENANCE_NAMES = (
+    "UNSIGNED",
+    "UNVERIFIED",
+    "UNTRUSTED",
     "UNKNOWN",
 )
 _AFFILIATION_SAME_OPERATOR = (
@@ -74,6 +73,7 @@ _AFFILIATION_UNKNOWN = (
     "UNKNOWN",
     "UNAFFILIATED",
     "INDEPENDENT",
+    "EXTERNAL",
     "NONE",
 )
 _MISSING_DECIDE = (
@@ -165,7 +165,7 @@ class LocalSentinelAdapter:
         findings = run each detector on artifact text
         verdict = flop_sentinel.policy.decide(
             findings,
-            provenance,   # flop_sentinel.models.Provenance enum
+            provenance,   # flop_sentinel.models.Provenance enum (paper → UNSIGNED)
             affiliation,  # flop_sentinel.models.Affiliation enum
             *,
             detector_error,
@@ -228,7 +228,7 @@ class LocalSentinelAdapter:
             models,
             param="provenance",
             model_name="Provenance",
-            names=_PROVENANCE_NAMES,
+            names=_PAPER_PROVENANCE_NAMES,
         )
         affiliation = _typed_arg(
             decide,
@@ -518,8 +518,10 @@ def _typed_arg(
     member = _enum_member(cls, *names)
     if member is not None:
         return member
+    available = _enum_labels(cls)
+    hint = f" (available: {', '.join(available)})" if available else ""
     raise AdapterError(
-        f"cannot map {names[0]!r} onto flop_sentinel.models.{model_name}; fail closed"
+        f"cannot map {names[0]!r} onto flop_sentinel.models.{model_name}{hint}; fail closed"
     )
 
 
@@ -559,6 +561,12 @@ def _enum_member(cls: Any, *names: str) -> Any | None:
         if key in by_value:
             return by_value[key]
     return None
+
+
+def _enum_labels(cls: Any) -> list[str]:
+    if not _is_enum_type(cls):
+        return []
+    return [str(member.name) for member in cls]
 
 
 def _is_enum_type(cls: Any) -> bool:
