@@ -224,11 +224,26 @@ DID with no offer, the plan is `DISQUALIFIED` rather than substituting a stub
 offer.
 
 Sentinel: `pip install -e ".[live]"` then install a local `flop_sentinel`
-checkout. The library is unpublished (`greg2718/flop-sentinel` is not a public
-clone target). Contract: run detectors on a normalized artifact, then
-`flop_sentinel.policy.decide(findings, provenance, affiliation, ...)`. The
-mapped `Verdict` uses `risk` / `decision` / `signals` / `findings` (rule ids
-only). Top-level `decide(artifact_type, artifact)` / `screen` is not the API.
+checkout (`pip install -e ~/dev/flop_sentinel`) or set `FLOP_WX_SENTINEL_PATH`
+/ `sentinel_path`. The library is unpublished (`greg2718/flop-sentinel` is not
+a public clone target). Real contract:
+
+- Detectors: `flop_sentinel.detectors.ALL_DETECTORS` (Detector classes).
+- Policy: `flop_sentinel.policy.decide(findings, provenance, affiliation, *,
+  detector_error, oversized, detector_versions, artifact_sha256)`.
+- `provenance` / `affiliation` are `flop_sentinel.models` enums, not dicts.
+- `policy` / `detectors` / `models` are submodules — import them; do not use
+  `getattr(flop_sentinel, "policy")` (empty `__init__.py` does not re-export).
+- Mapped `Verdict` → `ALLOW` / `REJECT` / `REVIEW` with **rule ids only**.
+- Top-level `decide(artifact_type, artifact)` / `screen` is not the API.
+
+Verify on Mac after `pip install -e ~/dev/flop_sentinel`:
+
+```bash
+python -m flop_work_exchange --config examples/live-ops.yaml doctor
+```
+
+`adapter_sentinel` should report `ok=true`.
 
 ### Doctor and live-demo
 
