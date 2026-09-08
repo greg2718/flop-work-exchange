@@ -104,7 +104,7 @@ missing — stub success is never labeled as live.
 | --- | --- | --- | --- |
 | Scout | [flop-scout](https://github.com/greg2718/flop-scout) | Reads optional local evidence JSONL; never opens a network socket | Tries `python flop_scout.py evidence feed --since-id 0 --format jsonl`; falls back to read-only `observer.sqlite` `evidence_records`. Caps candidates (default 25, ranked by evidence count) |
 | Router | [flop-router](https://github.com/greg2718/flop-router) | Lowest in-budget offer → Router decision document | Subprocess `router.py [--db projection] decision create --output … [--fixture …]`; maps `work_route` / plans; forces `SIMULATION_ONLY` / `DISABLED`. Probe fails closed unless a ≤1GiB db or fixture is usable |
-| Sentinel | local `flop_sentinel` (not published) | Artifact in → `ALLOW` / `REVIEW` / `REJECT`; fail-closed | Import `flop_sentinel` (`pip install -e ".[live]"` plus a local checkout, or `FLOP_WX_SENTINEL_PATH`); normalize artifact → detectors → `policy.decide(findings, provenance, affiliation, …)`; findings are rule ids only |
+| Sentinel | local `flop_sentinel` (not published) | Artifact in → `ALLOW` / `REVIEW` / `REJECT`; fail-closed | Import `flop_sentinel` (`pip install -e ".[live]"` plus a local checkout, or `FLOP_WX_SENTINEL_PATH`); build `Message`/`NormalizedText` via library normalize helpers → `ALL_DETECTORS.detect(message, nt, now)` → `policy.decide(findings, provenance, affiliation, …)`; findings are rule ids only |
 | Bench | [flop-bench](https://github.com/greg2718/flop-bench) | Checks `result_hash == sha256(result_text)`; no local exec | Generates a passive spec and runs `flop-bench verify --state-dir <temp>`; `--allow-local-exec` only if explicitly enabled |
 | TCLK | Router TCLK observations | Records `tclk-paper-*` deal ids | Still simulation until a live rail exists |
 | Settlement | n/a | `PaperSettlement` ledger debit/credit | `TestnetSettlement` always raises `NotLiveError` |
@@ -228,16 +228,27 @@ checkout (`pip install -e ~/dev/flop_sentinel`) or set `FLOP_WX_SENTINEL_PATH`
 / `sentinel_path`. The library is unpublished (`greg2718/flop-sentinel` is not
 a public clone target). Real contract:
 
-- Detectors: `flop_sentinel.detectors.ALL_DETECTORS` (Detector classes).
+- Detectors: `flop_sentinel.detectors.ALL_DETECTORS` is a tuple of **already
+  instantiated** Detector objects with `DETECTOR_ID` and `VERSION`. Prefer
+  `flop_sentinel.detectors.base.run_all(ALL_DETECTORS, message, nt, now)` which
+  returns `(findings, detector_error)`. Otherwise call
+  `detect(message: Message, nt: NormalizedText, now: float)` on each detector —
+  **not** `detect(text: str)`.
+- CLI construction: `Message(raw=payload_bytes, claimed_did=..., signature=None,
+  sender_id=..., room=..., nonce=...)` then
+  `nt = normalize(message.raw.decode("utf-8"))`. Reuse
+  `flop_sentinel.normalize.normalize`; do not invent a parallel normalizer.
 - Policy: `flop_sentinel.policy.decide(findings, provenance, affiliation, *,
-  detector_error, oversized, detector_versions, artifact_sha256)`.
+  detector_error, oversized, detector_versions, artifact_sha256)` with
+  `detector_versions={d.DETECTOR_ID: d.VERSION for d in ALL_DETECTORS}`.
 - `provenance` / `affiliation` are `flop_sentinel.models` enums, not dicts.
   Paper/local artifacts map to `Provenance.UNSIGNED` (unsigned paper jobs, not
   a made-up `LOCAL` token). Affiliation uses a real `Affiliation` member
   (`UNKNOWN` or `SELF_OPERATED` for family/same-operator peers). Unknown tokens
   fail closed.
-- `policy` / `detectors` / `models` are submodules — import them; do not use
-  `getattr(flop_sentinel, "policy")` (empty `__init__.py` does not re-export).
+- `policy` / `detectors` / `models` / `normalize` are submodules — import them;
+  do not use `getattr(flop_sentinel, "policy")` (empty `__init__.py` does not
+  re-export).
 - Mapped `Verdict` → `ALLOW` / `REJECT` / `REVIEW` with **rule ids only**.
 - Top-level `decide(artifact_type, artifact)` / `screen` is not the API.
 
