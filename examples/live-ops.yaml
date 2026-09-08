@@ -1,0 +1,29 @@
+payment_mode: paper
+settlement_backend: paper
+settlement_execution: DISABLED
+tclk_mode: SIMULATION_ONLY
+asset: FLOP
+fees:
+  job_posting_micro: 100000
+  orchestration_micro: 200000
+  completion_micro: 100000
+  bench_validation_micro: 50000
+  refund_posting_fee: false
+policy:
+  allow_same_operator_deals: true
+  same_operator_independent_reputation: false
+  same_operator_fee_volume_as_independent: false
+  allow_self_deals: false
+  treat_unknown_as_independent: false
+# Paper ops only. Local adapters never enable faucet/wallet/transfer.
+adapters:
+  scout_mode: local
+  bench_mode: local
+  router_mode: local
+  sentinel_mode: local
+  scout_repo: ~/dev/flop_scout_v02
+  scout_state_dir: ~/.flop_scout
+  bench_repo: ~/dev/flop_bench
+  bench_allow_local_exec: false
+  router_repo: ~/dev/flop-router
+  sentinel_path: ~/dev/flop_sentinel

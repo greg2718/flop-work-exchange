@@ -1,13 +1,13 @@
 """Adapter interfaces for Scout, Bench, Router, Sentinel, TCLK, and settlement.
 
 These are adapters only. They do not reimplement the sibling agents. Stubs
-work fully offline and return the sibling decision/verdict shapes so a later
-wiring pass can call the real packages without changing exchange orchestration.
+work fully offline and return the sibling decision/verdict shapes. Local*
+adapters subprocess or import the real packages when selected via config/env.
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from flop_work_exchange.models import (
     BenchVerdict,
@@ -21,18 +21,34 @@ from flop_work_exchange.models import (
 
 
 class ScoutAdapter(Protocol):
+    kind: str
+
+    def probe(self) -> dict[str, Any]: ...
+
     def find_candidates(self, job: Job) -> list[WorkerCandidate]: ...
 
 
 class RouterAdapter(Protocol):
+    kind: str
+
+    def probe(self) -> dict[str, Any]: ...
+
     def plan(self, job: Job, offers: list[Offer]) -> ExecutionPlan: ...
 
 
 class SentinelAdapter(Protocol):
-    def screen(self, artifact_type: str, artifact: dict[str, object]) -> SentinelVerdict: ...
+    kind: str
+
+    def probe(self) -> dict[str, Any]: ...
+
+    def screen(self, artifact_type: str, artifact: dict[str, Any]) -> SentinelVerdict: ...
 
 
 class BenchAdapter(Protocol):
+    kind: str
+
+    def probe(self) -> dict[str, Any]: ...
+
     def verify_delivery(self, job: Job) -> BenchVerdict: ...
 
 

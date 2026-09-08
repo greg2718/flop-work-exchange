@@ -95,16 +95,17 @@ fractional digits so they map onto integers. Binary floats are never used.
 
 ## Adapters (interfaces only)
 
-This package does **not** reimplement Scout, Bench, Router, or Sentinel. Stubs
-implement the sibling decision/verdict shapes so a later wiring pass can call
-the real local agents without changing orchestration.
+This package does **not** reimplement Scout, Bench, Router, or Sentinel. **Stub**
+adapters are the default (CI/offline). **Local** adapters can be selected via
+config or `FLOP_WX_*_MODE=local` and fail closed if the sibling backend is
+missing — stub success is never labeled as live.
 
-| Adapter | Sibling | Stub behavior | Later plug-in |
+| Adapter | Sibling | Stub behavior | Local wiring |
 | --- | --- | --- | --- |
-| Scout | [flop-scout](https://github.com/greg2718/flop-scout) | Reads optional local evidence JSONL; never opens a network socket | `python flop_scout.py evidence feed --since-id 0 --format jsonl` |
-| Router | [flop-router](https://github.com/greg2718/flop-router) | Lowest in-budget offer → Router decision document | Wrap `plan-execution` / `decision create`; keep `SIMULATION_ONLY` / `DISABLED` |
-| Sentinel | local `flop_sentinel` (not published) | Artifact in → `ALLOW` / `REVIEW` / `REJECT`; fail-closed | Call Sentinel’s pure library; stdlib + cryptography only |
-| Bench | [flop-bench](https://github.com/greg2718/flop-bench) | Checks `result_hash == sha256(result_text)`; no local exec | `flop-bench verify --state-dir ...`; local exec only with `--allow-local-exec` |
+| Scout | [flop-scout](https://github.com/greg2718/flop-scout) | Reads optional local evidence JSONL; never opens a network socket | Tries `python flop_scout.py evidence feed --since-id 0 --format jsonl`; falls back to read-only `observer.sqlite` `evidence_records` |
+| Router | [flop-router](https://github.com/greg2718/flop-router) | Lowest in-budget offer → Router decision document | Subprocess `router.py decision create --output …`; maps `work_route` / plans; forces `SIMULATION_ONLY` / `DISABLED` |
+| Sentinel | local `flop_sentinel` (not published) | Artifact in → `ALLOW` / `REVIEW` / `REJECT`; fail-closed | Import `flop_sentinel` (`pip install -e ".[live]"` plus a local checkout, or `FLOP_WX_SENTINEL_PATH`); findings omit attacker text |
+| Bench | [flop-bench](https://github.com/greg2718/flop-bench) | Checks `result_hash == sha256(result_text)`; no local exec | Generates a passive spec and runs `flop-bench verify --state-dir <temp>`; `--allow-local-exec` only if explicitly enabled |
 | TCLK | Router TCLK observations | Records `tclk-paper-*` deal ids | Still simulation until a live rail exists |
 | Settlement | n/a | `PaperSettlement` ledger debit/credit | `TestnetSettlement` always raises `NotLiveError` |
 
@@ -119,6 +120,95 @@ FLOP Sentinel UNKNOWN_NOT_PROVISIONED
 
 State isolation: Work Exchange must not use `~/.flop_agents/scout`,
 `~/.flop_agents/bench`, `~/.flop_agents/router`, or `~/.flop_agents/sentinel`.
+
+## Going live (paper ops)
+
+This is **not** a payment go-live. Official Technocore/FLOP faucet and payment
+endpoints still do not exist. `payment_mode` stays `"paper"`. TCLK stays
+`SIMULATION_ONLY`. `settlement_execution` stays `DISABLED`. Room “faucet claim”
+messages are not payment proof. Do not add wallet, transfer, or claim bots.
+
+Go-live phase 1 wires Greg’s **local** Scout / Bench / Router / Sentinel
+processes behind the existing adapter interfaces.
+
+### Mac paths
+
+Typical checkouts under `~/dev`:
+
+```text
+~/dev/flop_scout_v02      FLOP Scout (flop_scout.py, state ~/.flop_scout)
+~/dev/flop_bench          FLOP Bench (flop-bench CLI, state ~/.flop_agents/bench)
+~/dev/flop-router         FLOP Router (router.py, state ~/.flop_agents/router)
+~/dev/flop_sentinel       unpublished flop_sentinel library
+```
+
+Work Exchange production state is `~/.flop_agents/work-exchange/` only. Demos
+and tests must pass a temp `--state-dir`. Live Bench verify uses its **own**
+temp `--state-dir` and must not write into `~/.flop_agents/bench`.
+
+### Selecting local adapters
+
+Environment (overrides `examples/live-ops.yaml`):
+
+```bash
+export FLOP_WX_SCOUT_MODE=local
+export FLOP_WX_BENCH_MODE=local
+export FLOP_WX_ROUTER_MODE=local
+export FLOP_WX_SENTINEL_MODE=local
+export FLOP_WX_SCOUT_REPO=~/dev/flop_scout_v02
+export FLOP_SCOUT_STATE_DIR=~/.flop_scout
+export FLOP_WX_BENCH_REPO=~/dev/flop_bench
+export FLOP_WX_BENCH_ALLOW_LOCAL_EXEC=false   # default; do not enable casually
+export FLOP_WX_ROUTER_REPO=~/dev/flop-router
+export FLOP_WX_SENTINEL_PATH=~/dev/flop_sentinel
+```
+
+Or `--config examples/live-ops.yaml`. Stubs remain the default when modes are
+unset, so CI stays offline.
+
+If a local backend is missing, the adapter raises `AdapterError` instead of
+returning stub success labeled as live.
+
+Scout CLI contract (tried first; Scout v0.3.3 does not yet implement `feed`):
+
+```bash
+python flop_scout.py evidence feed --since-id 0 --format jsonl
+```
+
+Local fallback: read-only `evidence_records` in `observer.sqlite`. Scout
+`observe` / `read` / `say` are never invoked (those use the network).
+
+Router CLI contract:
+
+```bash
+python router.py decision create "<task>" --output /tmp/wx-router-decision.json \
+  --job-id FLOP-JOB-... --job-proto flop-work-exchange.job.v0.1 \
+  --verification-mode OBJECTIVE_BENCH --asset FLOP --max-amount <budget_micro>
+```
+
+`flop-router` is a single-file script, not an importable package. The wrapper
+maps `work_route` / `settlement_plan` / `verification_plan` / `security_policy`
+and matches the worker DID to an open Work Exchange offer. If Router selects a
+DID with no offer, the plan is `DISQUALIFIED` rather than substituting a stub
+offer.
+
+Sentinel: `pip install -e ".[live]"` then install a local `flop_sentinel`
+checkout. Expected API: `decide` or `screen` (module or `Sentinel()`).
+
+### Doctor and live-demo
+
+```bash
+flop-work-exchange doctor
+flop-work-exchange --state-dir /tmp/wx doctor
+flop-work-exchange live-demo --state-dir /tmp/wx-live
+```
+
+`doctor` reports adapter modes, path probes, identity (public metadata only),
+and isolation. `live-demo` runs one paper job, preferring local adapters that
+probe OK and falling back to stubs with explicit `adapter_notes`. It uses
+ephemeral demo DIDs (not family DIDs) so same-operator Scout/Bench/Router
+identities are not presented as independent workers.
+
 
 ## Paper → testnet switch
 
@@ -183,6 +273,8 @@ flop-work-exchange --state-dir /tmp/wx verify --job-id FLOP-JOB-...
 flop-work-exchange --state-dir /tmp/wx settle --job-id FLOP-JOB-...
 flop-work-exchange --state-dir /tmp/wx show-receipt --job-id FLOP-JOB-...
 python -m flop_work_exchange demo --state-dir /tmp/wx-demo
+flop-work-exchange doctor
+flop-work-exchange live-demo --state-dir /tmp/wx-live
 ```
 
 ## Related agents
