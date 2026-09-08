@@ -24,9 +24,9 @@ from flop_work_exchange.adapters.router import (
 )
 from flop_work_exchange.adapters.scout import LocalScoutAdapter, StubScoutAdapter
 from flop_work_exchange.adapters.sentinel import (
+    _PAPER_PROVENANCE_NAMES,
     LocalSentinelAdapter,
     StubSentinelAdapter,
-    _PAPER_PROVENANCE_NAMES,
     sanitize_sentinel_reasons,
 )
 from flop_work_exchange.canonical import result_hash_for
