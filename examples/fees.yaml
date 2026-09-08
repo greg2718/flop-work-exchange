@@ -1,0 +1,17 @@
+payment_mode: paper
+settlement_backend: paper
+settlement_execution: DISABLED
+tclk_mode: SIMULATION_ONLY
+asset: FLOP
+fees:
+  job_posting_micro: 100000
+  orchestration_micro: 200000
+  completion_micro: 100000
+  bench_validation_micro: 50000
+  refund_posting_fee: false
+policy:
+  allow_same_operator_deals: true
+  same_operator_independent_reputation: false
+  same_operator_fee_volume_as_independent: false
+  allow_self_deals: false
+  treat_unknown_as_independent: false
