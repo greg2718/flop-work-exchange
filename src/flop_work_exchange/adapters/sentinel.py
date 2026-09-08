@@ -46,6 +46,8 @@ _DECISION_MAP = {
     "BLOCK": "REJECT",
     "BLOCKED": "REJECT",
     "FAIL": "REJECT",
+    "QUARANTINE": "REJECT",
+    "QUARANTINED": "REJECT",
     "REVIEW": "REVIEW",
     "WARN": "REVIEW",
     "HOLD": "REVIEW",
@@ -54,17 +56,19 @@ _DECISION_MAP = {
 _HIGH_RISK = {"high", "critical", "severe", "reject"}
 _MEDIUM_RISK = {"medium", "moderate", "review"}
 _LOW_RISK = {"low", "info", "informational", "none", "allow"}
-_PROVENANCE_NAMES = (
-    "LOCAL",
-    "WORK_EXCHANGE",
-    "INTERNAL",
-    "EXCHANGE",
-    "SYNTHETIC",
-    "PAPER",
-    "USER",
+# Confirmed Mac flop_sentinel.models members:
+#   Provenance: SIGNED_VERIFIED, SIGNED_INVALID, UNSIGNED, MALFORMED
+#   Affiliation: SELF_OPERATED, UNKNOWN
+# Paper-FLOP artifacts are unsigned paper jobs, not on-chain signed receipts.
+# Do not invent a 'LOCAL' provenance token — that is not in the library enum.
+_PAPER_PROVENANCE_NAMES = (
+    "UNSIGNED",
+    "UNVERIFIED",
+    "UNTRUSTED",
     "UNKNOWN",
 )
 _AFFILIATION_SAME_OPERATOR = (
+    "SELF_OPERATED",
     "SAME_OPERATOR",
     "FAMILY",
     "AFFILIATED",
@@ -74,6 +78,7 @@ _AFFILIATION_UNKNOWN = (
     "UNKNOWN",
     "UNAFFILIATED",
     "INDEPENDENT",
+    "EXTERNAL",
     "NONE",
 )
 _MISSING_DECIDE = (
@@ -165,8 +170,8 @@ class LocalSentinelAdapter:
         findings = run each detector on artifact text
         verdict = flop_sentinel.policy.decide(
             findings,
-            provenance,   # flop_sentinel.models.Provenance enum
-            affiliation,  # flop_sentinel.models.Affiliation enum
+            provenance,   # flop_sentinel.models.Provenance (paper → UNSIGNED)
+            affiliation,  # flop_sentinel.models.Affiliation (SELF_OPERATED / UNKNOWN)
             *,
             detector_error,
             oversized,
@@ -228,7 +233,7 @@ class LocalSentinelAdapter:
             models,
             param="provenance",
             model_name="Provenance",
-            names=_PROVENANCE_NAMES,
+            names=_PAPER_PROVENANCE_NAMES,
         )
         affiliation = _typed_arg(
             decide,
@@ -518,8 +523,10 @@ def _typed_arg(
     member = _enum_member(cls, *names)
     if member is not None:
         return member
+    available = _enum_labels(cls)
+    hint = f" (available: {', '.join(available)})" if available else ""
     raise AdapterError(
-        f"cannot map {names[0]!r} onto flop_sentinel.models.{model_name}; fail closed"
+        f"cannot map {names[0]!r} onto flop_sentinel.models.{model_name}{hint}; fail closed"
     )
 
 
@@ -561,6 +568,12 @@ def _enum_member(cls: Any, *names: str) -> Any | None:
     return None
 
 
+def _enum_labels(cls: Any) -> list[str]:
+    if not _is_enum_type(cls):
+        return []
+    return [str(member.name) for member in cls]
+
+
 def _is_enum_type(cls: Any) -> bool:
     return isinstance(cls, type) and issubclass(cls, Enum)
 
@@ -569,8 +582,8 @@ def _affiliation_names(artifact: dict[str, Any]) -> tuple[str, ...]:
     explicit = artifact.get("operator_relationship")
     if isinstance(explicit, str) and explicit.strip():
         token = explicit.strip().upper()
-        if token in {"SAME_OPERATOR", "RELATED"}:
-            return (token, *_AFFILIATION_SAME_OPERATOR, *_AFFILIATION_UNKNOWN)
+        if token in {"SAME_OPERATOR", "RELATED", "SELF_OPERATED"}:
+            return ("SELF_OPERATED", token, *_AFFILIATION_SAME_OPERATOR, *_AFFILIATION_UNKNOWN)
         if token in {"INDEPENDENT", "UNKNOWN"}:
             return (token, *_AFFILIATION_UNKNOWN)
     dids = _extract_dids(artifact)

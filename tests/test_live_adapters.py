@@ -24,6 +24,7 @@ from flop_work_exchange.adapters.router import (
 )
 from flop_work_exchange.adapters.scout import LocalScoutAdapter, StubScoutAdapter
 from flop_work_exchange.adapters.sentinel import (
+    _PAPER_PROVENANCE_NAMES,
     LocalSentinelAdapter,
     StubSentinelAdapter,
     sanitize_sentinel_reasons,
@@ -279,16 +280,25 @@ def test_local_router_probe_requires_usable_db_or_fixture(
     assert "projection" in oversized["error"].lower() or "Scout" in oversized["error"]
 
 
-def _real_shaped_sentinel_module() -> tuple[SimpleNamespace, dict[str, object]]:
+def _real_shaped_sentinel_module(
+    *,
+    provenance_cls: type[Enum] | None = None,
+    affiliation_cls: type[Enum] | None = None,
+) -> tuple[SimpleNamespace, dict[str, object]]:
     """Minimal flop_sentinel contract: policy.decide + ALL_DETECTORS + typed models."""
 
-    class Provenance(Enum):
-        LOCAL = "local"
+    class DefaultProvenance(Enum):
+        SIGNED_VERIFIED = "signed_verified"
+        SIGNED_INVALID = "signed_invalid"
+        UNSIGNED = "unsigned"
+        MALFORMED = "malformed"
+
+    class DefaultAffiliation(Enum):
+        SELF_OPERATED = "self_operated"
         UNKNOWN = "unknown"
 
-    class Affiliation(Enum):
-        SAME_OPERATOR = "same_operator"
-        UNKNOWN = "unknown"
+    Provenance = provenance_cls or DefaultProvenance
+    Affiliation = affiliation_cls or DefaultAffiliation
 
     class Decision(Enum):
         ALLOW = "ALLOW"
@@ -379,11 +389,13 @@ from enum import Enum
 from dataclasses import dataclass
 
 class Provenance(Enum):
-    LOCAL = "local"
-    UNKNOWN = "unknown"
+    SIGNED_VERIFIED = "signed_verified"
+    SIGNED_INVALID = "signed_invalid"
+    UNSIGNED = "unsigned"
+    MALFORMED = "malformed"
 
 class Affiliation(Enum):
-    SAME_OPERATOR = "same_operator"
+    SELF_OPERATED = "self_operated"
     UNKNOWN = "unknown"
 
 class Decision(Enum):
@@ -498,8 +510,10 @@ def test_local_sentinel_maps_typed_decide_and_all_detectors() -> None:
     assert "pwn" not in " ".join(verdict.reasons)
     assert "evil.example" not in " ".join(verdict.reasons)
     assert "ignore previous" not in " ".join(verdict.reasons).lower()
-    assert captured["provenance"].name == "LOCAL"
+    assert captured["provenance"].name == "UNSIGNED"
+    assert captured["provenance"].value == "unsigned"
     assert captured["affiliation"].name == "UNKNOWN"
+    assert "LOCAL" not in {member.name for member in type(captured["provenance"])}
     assert captured["detector_versions"] == {"prompt_injection": "test-1"}
     assert isinstance(captured["artifact_sha256"], str)
     assert len(str(captured["artifact_sha256"])) == 64
@@ -511,7 +525,92 @@ def test_local_sentinel_maps_typed_decide_and_all_detectors() -> None:
     assert clean.action == "ALLOW"
 
     adapter.screen("offer", {"seller_did": FAMILY_SCOUT, "notes": "ok"})
-    assert captured["affiliation"].name == "SAME_OPERATOR"
+    assert captured["affiliation"].name == "SELF_OPERATED"
+    assert isinstance(captured["affiliation"], Enum)
+
+
+def test_local_sentinel_maps_paper_artifact_to_unsigned_provenance() -> None:
+    """Paper/local jobs map onto Provenance.UNSIGNED, never a raw 'LOCAL' string."""
+    assert "LOCAL" not in _PAPER_PROVENANCE_NAMES
+    assert _PAPER_PROVENANCE_NAMES[0] == "UNSIGNED"
+
+    module, captured = _real_shaped_sentinel_module()
+    provenance_cls = module.models.Provenance
+    affiliation_cls = module.models.Affiliation
+    assert not hasattr(provenance_cls, "LOCAL")
+    assert {member.name for member in provenance_cls} == {
+        "SIGNED_VERIFIED",
+        "SIGNED_INVALID",
+        "UNSIGNED",
+        "MALFORMED",
+    }
+
+    adapter = LocalSentinelAdapter(importer=lambda: module)
+    verdict = adapter.screen("job", {"outcome": "Produce a paper settlement summary."})
+    assert verdict.action == "ALLOW"
+    assert captured["provenance"] is provenance_cls.UNSIGNED
+    assert captured["provenance"].name == "UNSIGNED"
+    assert captured["affiliation"] is affiliation_cls.UNKNOWN
+    assert isinstance(captured["provenance"], provenance_cls)
+    assert isinstance(captured["affiliation"], affiliation_cls)
+
+
+def test_local_sentinel_maps_family_did_to_real_affiliation_member() -> None:
+    class Affiliation(Enum):
+        SELF_OPERATED = "self_operated"
+        UNKNOWN = "unknown"
+
+    module, captured = _real_shaped_sentinel_module(affiliation_cls=Affiliation)
+    LocalSentinelAdapter(importer=lambda: module).screen(
+        "offer", {"seller_did": FAMILY_SCOUT, "notes": "ok"}
+    )
+    assert captured["affiliation"] is Affiliation.SELF_OPERATED
+    assert captured["affiliation"].name != "LOCAL"
+
+    LocalSentinelAdapter(importer=lambda: module).screen(
+        "job", {"outcome": "paper summary"}
+    )
+    assert captured["affiliation"] is Affiliation.UNKNOWN
+
+    LocalSentinelAdapter(importer=lambda: module).screen(
+        "offer",
+        {"seller_did": fresh_dids()[1], "operator_relationship": "same_operator"},
+    )
+    assert captured["affiliation"] is Affiliation.SELF_OPERATED
+
+
+def test_local_sentinel_prefers_unsigned_even_when_local_alias_exists() -> None:
+    class Provenance(Enum):
+        LOCAL = "local"
+        UNSIGNED = "unsigned"
+        UNKNOWN = "unknown"
+
+    module, captured = _real_shaped_sentinel_module(provenance_cls=Provenance)
+    LocalSentinelAdapter(importer=lambda: module).screen("job", {"outcome": "paper only"})
+    assert captured["provenance"] is Provenance.UNSIGNED
+    assert captured["provenance"].name != "LOCAL"
+
+
+def test_local_sentinel_fail_closed_on_unknown_provenance_tokens() -> None:
+    class Provenance(Enum):
+        SIGNED_VERIFIED = "signed_verified"
+        SIGNED_INVALID = "signed_invalid"
+        MALFORMED = "malformed"
+
+    module, _captured = _real_shaped_sentinel_module(provenance_cls=Provenance)
+    adapter = LocalSentinelAdapter(importer=lambda: module)
+    with pytest.raises(AdapterError, match="cannot map 'UNSIGNED'.*Provenance"):
+        adapter.screen("job", {"outcome": "paper only"})
+
+
+def test_local_sentinel_fail_closed_on_unknown_affiliation_tokens() -> None:
+    class Affiliation(Enum):
+        WEIRD = "weird"
+
+    module, _captured = _real_shaped_sentinel_module(affiliation_cls=Affiliation)
+    adapter = LocalSentinelAdapter(importer=lambda: module)
+    with pytest.raises(AdapterError, match="cannot map .*Affiliation"):
+        adapter.screen("job", {"outcome": "paper only"})
 
 
 def test_local_sentinel_collects_all_detectors() -> None:
@@ -575,7 +674,7 @@ def test_local_sentinel_src_layout_imports_policy_submodule(tmp_path: Path) -> N
         assert verdict.reasons[0] == "SENT-PI-1"
         assert "pwn" not in " ".join(verdict.reasons)
         policy = sys.modules["flop_sentinel.policy"]
-        assert policy.LAST_CALL["provenance"].name == "LOCAL"
+        assert policy.LAST_CALL["provenance"].name == "UNSIGNED"
         assert not isinstance(policy.LAST_CALL["provenance"], dict)
     finally:
         _purge_imported_sentinel()
