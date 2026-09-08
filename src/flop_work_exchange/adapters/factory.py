@@ -23,6 +23,8 @@ from flop_work_exchange.constants import (
     MAC_SCOUT_REPO,
     MAC_SENTINEL_REPO,
     ROUTER_FIXTURE_RELATIVE,
+    SCOUT_PROJECTION_FILENAMES,
+    SCOUT_WAREHOUSE_DB_NAME,
 )
 
 
@@ -56,14 +58,22 @@ def _resolve_scout(config: AdapterConfig) -> StubScoutAdapter | LocalScoutAdapte
         state_dir = LEGACY_SCOUT_STATE
     db_path = config.scout_db
     if db_path is None and state_dir is not None:
-        db_path = state_dir / "observer.sqlite"
+        db_path = state_dir / SCOUT_WAREHOUSE_DB_NAME
+    projection_db = config.scout_projection_db
+    if projection_db is None and state_dir is not None:
+        projection_db = first_existing_file(
+            *(state_dir / name for name in SCOUT_PROJECTION_FILENAMES)
+        )
     return LocalScoutAdapter(
         script=script,
         python=config.python,
         state_dir=state_dir,
         db_path=db_path,
+        projection_db=projection_db,
         evidence_jsonl=config.scout_evidence_jsonl,
         timeout_seconds=config.timeout_seconds,
+        sqlite_timeout_seconds=config.scout_sqlite_timeout_seconds,
+        max_db_bytes=config.scout_max_db_bytes,
         candidate_limit=config.scout_candidate_limit,
     )
 

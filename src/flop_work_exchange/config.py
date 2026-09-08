@@ -13,9 +13,11 @@ from flop_work_exchange.amounts import parse_micro
 from flop_work_exchange.canonical import atomic_write_json
 from flop_work_exchange.constants import (
     DEFAULT_SCOUT_CANDIDATE_LIMIT,
+    DEFAULT_SCOUT_SQLITE_TIMEOUT_SECONDS,
     EXCHANGE_OPERATOR_GROUP,
     KNOWN_FAMILY_DIDS,
     MAX_SCOUT_CANDIDATE_LIMIT,
+    SCOUT_MAX_QUERY_DB_BYTES,
     assert_isolated_state_dir,
 )
 from flop_work_exchange.exceptions import ValidationError
@@ -81,6 +83,26 @@ def _candidate_limit(value: Any, label: str) -> int:
     return min(limit, MAX_SCOUT_CANDIDATE_LIMIT)
 
 
+def _positive_float(value: Any, label: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{label} must be a number") from exc
+    if parsed <= 0:
+        raise ValidationError(f"{label} must be > 0")
+    return parsed
+
+
+def _positive_int(value: Any, label: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{label} must be an integer") from exc
+    if parsed <= 0:
+        raise ValidationError(f"{label} must be > 0")
+    return parsed
+
+
 def _env_flag(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None:
@@ -101,7 +123,10 @@ class AdapterConfig:
     scout_script: Path | None = None
     scout_state_dir: Path | None = None
     scout_db: Path | None = None
+    scout_projection_db: Path | None = None
     scout_evidence_jsonl: Path | None = None
+    scout_sqlite_timeout_seconds: float = DEFAULT_SCOUT_SQLITE_TIMEOUT_SECONDS
+    scout_max_db_bytes: int = SCOUT_MAX_QUERY_DB_BYTES
     bench_cli: str | None = None
     bench_repo: Path | None = None
     bench_allow_local_exec: bool = False
@@ -124,9 +149,14 @@ class AdapterConfig:
             "scout_script": str(self.scout_script) if self.scout_script else None,
             "scout_state_dir": str(self.scout_state_dir) if self.scout_state_dir else None,
             "scout_db": str(self.scout_db) if self.scout_db else None,
+            "scout_projection_db": (
+                str(self.scout_projection_db) if self.scout_projection_db else None
+            ),
             "scout_evidence_jsonl": (
                 str(self.scout_evidence_jsonl) if self.scout_evidence_jsonl else None
             ),
+            "scout_sqlite_timeout_seconds": self.scout_sqlite_timeout_seconds,
+            "scout_max_db_bytes": self.scout_max_db_bytes,
             "bench_cli": self.bench_cli,
             "bench_repo": str(self.bench_repo) if self.bench_repo else None,
             "bench_allow_local_exec": self.bench_allow_local_exec,
@@ -259,6 +289,10 @@ def adapter_config_from_mapping(raw: Any | None) -> AdapterConfig:
         timeout = float(timeout_raw)
     except (TypeError, ValueError) as exc:
         raise ValidationError("adapters.timeout_seconds must be a number") from exc
+    sqlite_timeout = mapping.get(
+        "scout_sqlite_timeout_seconds", DEFAULT_SCOUT_SQLITE_TIMEOUT_SECONDS
+    )
+    max_db_bytes = mapping.get("scout_max_db_bytes", SCOUT_MAX_QUERY_DB_BYTES)
     return AdapterConfig(
         scout_mode=_adapter_mode(mapping.get("scout_mode", "stub"), "scout_mode"),
         bench_mode=_adapter_mode(mapping.get("bench_mode", "stub"), "bench_mode"),
@@ -269,7 +303,12 @@ def adapter_config_from_mapping(raw: Any | None) -> AdapterConfig:
         scout_script=_optional_path(mapping.get("scout_script")),
         scout_state_dir=_optional_path(mapping.get("scout_state_dir")),
         scout_db=_optional_path(mapping.get("scout_db")),
+        scout_projection_db=_optional_path(mapping.get("scout_projection_db")),
         scout_evidence_jsonl=_optional_path(mapping.get("scout_evidence_jsonl")),
+        scout_sqlite_timeout_seconds=_positive_float(
+            sqlite_timeout, "adapters.scout_sqlite_timeout_seconds"
+        ),
+        scout_max_db_bytes=_positive_int(max_db_bytes, "adapters.scout_max_db_bytes"),
         bench_cli=str(mapping["bench_cli"]) if mapping.get("bench_cli") else None,
         bench_repo=_optional_path(mapping.get("bench_repo")),
         bench_allow_local_exec=bool(mapping.get("bench_allow_local_exec", False)),
@@ -321,6 +360,7 @@ def overlay_adapter_env(base: AdapterConfig) -> AdapterConfig:
         "scout_script": "FLOP_WX_SCOUT_SCRIPT",
         "scout_state_dir": "FLOP_WX_SCOUT_STATE_DIR",
         "scout_db": "FLOP_WX_SCOUT_DB",
+        "scout_projection_db": "FLOP_WX_SCOUT_PROJECTION_DB",
         "scout_evidence_jsonl": "FLOP_WX_SCOUT_EVIDENCE_JSONL",
         "bench_repo": "FLOP_WX_BENCH_REPO",
         "router_repo": "FLOP_WX_ROUTER_REPO",
@@ -345,6 +385,16 @@ def overlay_adapter_env(base: AdapterConfig) -> AdapterConfig:
             updates["timeout_seconds"] = float(os.environ["FLOP_WX_ADAPTER_TIMEOUT"])
         except ValueError as exc:
             raise ValidationError("FLOP_WX_ADAPTER_TIMEOUT must be a number") from exc
+    if os.environ.get("FLOP_WX_SCOUT_SQLITE_TIMEOUT"):
+        updates["scout_sqlite_timeout_seconds"] = _positive_float(
+            os.environ["FLOP_WX_SCOUT_SQLITE_TIMEOUT"],
+            "FLOP_WX_SCOUT_SQLITE_TIMEOUT",
+        )
+    if os.environ.get("FLOP_WX_SCOUT_MAX_DB_BYTES"):
+        updates["scout_max_db_bytes"] = _positive_int(
+            os.environ["FLOP_WX_SCOUT_MAX_DB_BYTES"],
+            "FLOP_WX_SCOUT_MAX_DB_BYTES",
+        )
     if os.environ.get("FLOP_WX_SCOUT_CANDIDATE_LIMIT"):
         updates["scout_candidate_limit"] = _candidate_limit(
             os.environ["FLOP_WX_SCOUT_CANDIDATE_LIMIT"],

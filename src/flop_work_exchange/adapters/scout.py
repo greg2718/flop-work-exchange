@@ -2,23 +2,29 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from flop_work_exchange.adapters.process import CommandResult, run_argv
 from flop_work_exchange.constants import (
     DEFAULT_SCOUT_CANDIDATE_LIMIT,
+    DEFAULT_SCOUT_SQLITE_TIMEOUT_SECONDS,
     EXCHANGE_OPERATOR_GROUP,
     KNOWN_FAMILY_DIDS,
     MAX_EVIDENCE_IDS_PER_CANDIDATE,
     SCOUT_EVIDENCE_FEED_CLI,
+    SCOUT_MAX_QUERY_DB_BYTES,
+    SCOUT_WAREHOUSE_DB_NAME,
 )
 from flop_work_exchange.exceptions import AdapterError
 from flop_work_exchange.identity import is_valid_ed25519_did
 from flop_work_exchange.models import Job, WorkerCandidate
 
 CommandRunner = Callable[..., CommandResult]
+T = TypeVar("T")
 
 
 def candidates_from_records(
@@ -172,14 +178,21 @@ class StubScoutAdapter:
 class LocalScoutAdapter:
     """Local Scout adapter. Reads a local evidence feed or observer DB only.
 
-    Expected CLI (not yet in Scout v0.3.3; tried first when a script is configured):
+    Preference order:
 
-        python flop_scout.py evidence feed --since-id 0 --format jsonl
+    1. Configured evidence JSONL (``scout_evidence_jsonl``)
+    2. Scout projection SQLite (``scout_projection_db``, ≤1GiB by default)
+    3. CLI ``python flop_scout.py evidence feed --since-id 0 --format jsonl``
+       (timeout_seconds; Scout v0.3.3 may not implement ``feed`` yet)
+    4. Raw observer warehouse (``observer.sqlite``) only when it is ≤ the size
+       cap, with a hard sqlite wall-clock timeout
 
-    Fallback: read-only ``evidence_records`` in the local observer SQLite DB
-    (``~/.flop_scout/observer.sqlite`` or ``FLOP_SCOUT_STATE_DIR``). Never runs
-    ``observe`` / ``read`` / ``say`` (those hit the network). Fail closed if no
-    local backend is present — this adapter never silently becomes the stub.
+    Oversized warehouses (~48–52GiB ``observer.sqlite``) are never scanned.
+    ``GROUP BY did`` over the full table would hang even with ``LIMIT``. Fail
+    closed with ``AdapterError`` so live-demo can fall back to the stub.
+
+    Never runs ``observe`` / ``read`` / ``say`` (those hit the network). This
+    adapter never silently becomes the stub while still labeled live.
     """
 
     kind = "local"
@@ -191,8 +204,11 @@ class LocalScoutAdapter:
         python: str = "python3",
         state_dir: Path | None = None,
         db_path: Path | None = None,
+        projection_db: Path | None = None,
         evidence_jsonl: Path | None = None,
         timeout_seconds: float = 30.0,
+        sqlite_timeout_seconds: float = DEFAULT_SCOUT_SQLITE_TIMEOUT_SECONDS,
+        max_db_bytes: int = SCOUT_MAX_QUERY_DB_BYTES,
         run_command: CommandRunner | None = None,
         candidate_limit: int = DEFAULT_SCOUT_CANDIDATE_LIMIT,
     ) -> None:
@@ -200,24 +216,33 @@ class LocalScoutAdapter:
         self.python = python
         self.state_dir = state_dir.expanduser() if state_dir is not None else None
         self.db_path = db_path.expanduser() if db_path is not None else None
+        self.projection_db = projection_db.expanduser() if projection_db is not None else None
         self.evidence_jsonl = evidence_jsonl.expanduser() if evidence_jsonl is not None else None
         self.timeout_seconds = timeout_seconds
+        self.sqlite_timeout_seconds = sqlite_timeout_seconds
+        self.max_db_bytes = max_db_bytes
         self._run_command = run_command or run_argv
         self.candidate_limit = candidate_limit
 
     def probe(self) -> dict[str, Any]:
-        sources = self._available_sources()
-        ok = bool(sources)
+        plan = self._source_plan()
         return {
-            "ok": ok,
+            "ok": plan["ok"],
             "kind": self.kind,
             "cli_contract": SCOUT_EVIDENCE_FEED_CLI,
             "script": str(self.script) if self.script else None,
             "db_path": str(self._resolved_db_path()) if self._resolved_db_path() else None,
+            "projection_db": str(self.projection_db) if self.projection_db else None,
             "evidence_jsonl": str(self.evidence_jsonl) if self.evidence_jsonl else None,
             "candidate_limit": self.candidate_limit,
-            "sources": sources,
-            "error": None if ok else "Scout local backend missing (script, observer DB, or JSONL)",
+            "sqlite_timeout_seconds": self.sqlite_timeout_seconds,
+            "max_db_bytes": self.max_db_bytes,
+            "preferred_source": plan["preferred_source"],
+            "sources": plan["sources"],
+            "warehouse": plan["warehouse"],
+            "projection": plan["projection"],
+            "error": None if plan["ok"] else plan["error"],
+            "note": plan.get("note"),
         }
 
     def find_candidates(self, job: Job) -> list[WorkerCandidate]:
@@ -230,40 +255,105 @@ class LocalScoutAdapter:
             limit=self.candidate_limit,
         )
 
-    def _available_sources(self) -> list[str]:
+    def _source_plan(self) -> dict[str, Any]:
         sources: list[str] = []
-        if self.script is not None and self.script.is_file():
-            sources.append(f"script:{self.script}")
-        db_path = self._resolved_db_path()
-        if db_path is not None and db_path.is_file():
-            sources.append(f"sqlite:{db_path}")
+        preferred: str | None = None
+
+        def add(kind: str, label: str) -> None:
+            nonlocal preferred
+            sources.append(label)
+            if preferred is None:
+                preferred = kind
+
         if self.evidence_jsonl is not None and self.evidence_jsonl.is_file():
-            sources.append(f"jsonl:{self.evidence_jsonl}")
-        return sources
+            add("jsonl", f"jsonl:{self.evidence_jsonl}")
+        projection = assess_scout_sqlite(
+            self.projection_db, max_bytes=self.max_db_bytes, role="projection"
+        )
+        if projection.get("ok"):
+            add("projection", f"projection:{projection['path']}")
+        if self.script is not None and self.script.is_file():
+            add("cli", f"script:{self.script}")
+        warehouse = assess_scout_sqlite(
+            self._resolved_db_path(), max_bytes=self.max_db_bytes, role="warehouse"
+        )
+        if warehouse.get("ok"):
+            add("sqlite", f"sqlite:{warehouse['path']}")
+        note = None
+        error = None
+        if warehouse.get("oversized"):
+            note = str(warehouse.get("error") or "")
+        if not sources:
+            error = note or (
+                "Scout local backend missing (JSONL, projection ≤1GiB, script, "
+                "or observer DB under the size cap)"
+            )
+        return {
+            "ok": bool(sources),
+            "preferred_source": preferred,
+            "sources": sources,
+            "warehouse": warehouse,
+            "projection": projection,
+            "error": error,
+            "note": note,
+        }
 
     def _resolved_db_path(self) -> Path | None:
         if self.db_path is not None:
             return self.db_path
         if self.state_dir is not None:
-            return self.state_dir / "observer.sqlite"
+            return self.state_dir / SCOUT_WAREHOUSE_DB_NAME
         return None
 
     def _load_records(self) -> tuple[list[dict[str, Any]], str]:
+        errors: list[str] = []
+        if self.evidence_jsonl is not None and self.evidence_jsonl.is_file():
+            return _read_jsonl_records(self.evidence_jsonl), "local-scout-jsonl"
+
+        projection = assess_scout_sqlite(
+            self.projection_db, max_bytes=self.max_db_bytes, role="projection"
+        )
+        if projection.get("ok"):
+            try:
+                return (
+                    self._records_from_sqlite(Path(str(projection["path"]))),
+                    "local-scout-projection",
+                )
+            except AdapterError as exc:
+                errors.append(str(exc))
+        elif self.projection_db is not None:
+            errors.append(
+                str(projection.get("error") or f"projection unusable: {self.projection_db}")
+            )
+
         if self.script is not None and self.script.is_file():
             try:
                 return self._records_from_feed_cli(), "local-scout-feed"
-            except AdapterError:
-                # Scout v0.3.3 has no `evidence feed` yet; fall through to local DB.
-                pass
-        db_path = self._resolved_db_path()
-        if db_path is not None and db_path.is_file():
-            return self._records_from_sqlite(db_path), "local-scout-sqlite"
-        if self.evidence_jsonl is not None and self.evidence_jsonl.is_file():
-            return _read_jsonl_records(self.evidence_jsonl), "local-scout-jsonl"
+            except AdapterError as exc:
+                # Scout v0.3.3 has no `evidence feed` yet; fall through.
+                errors.append(str(exc))
+
+        warehouse = assess_scout_sqlite(
+            self._resolved_db_path(), max_bytes=self.max_db_bytes, role="warehouse"
+        )
+        if warehouse.get("ok"):
+            try:
+                return (
+                    self._records_from_sqlite(Path(str(warehouse["path"]))),
+                    "local-scout-sqlite",
+                )
+            except AdapterError as exc:
+                errors.append(str(exc))
+        elif self._resolved_db_path() is not None:
+            errors.append(str(warehouse.get("error") or "Scout sqlite warehouse unusable"))
+
+        detail = f" ({'; '.join(errors)})" if errors else ""
         raise AdapterError(
-            "LocalScoutAdapter: Scout backend missing. Configure FLOP_WX_SCOUT_SCRIPT, "
-            "FLOP_WX_SCOUT_DB / FLOP_SCOUT_STATE_DIR, or FLOP_WX_SCOUT_EVIDENCE_JSONL. "
-            f"Expected CLI: {SCOUT_EVIDENCE_FEED_CLI}"
+            "LocalScoutAdapter: Scout backend missing. Configure "
+            "FLOP_WX_SCOUT_EVIDENCE_JSONL, FLOP_WX_SCOUT_PROJECTION_DB (≤1GiB), "
+            "FLOP_WX_SCOUT_SCRIPT, or a small FLOP_WX_SCOUT_DB. "
+            "Raw observer.sqlite warehouses are not queried. "
+            f"Expected CLI: {SCOUT_EVIDENCE_FEED_CLI}{detail}"
         )
 
     def _records_from_feed_cli(self) -> list[dict[str, Any]]:
@@ -293,15 +383,10 @@ class LocalScoutAdapter:
         return _parse_jsonl_text(result.stdout)
 
     def _records_from_sqlite(self, db_path: Path) -> list[dict[str, Any]]:
-        uri = f"file:{db_path.resolve()}?mode=ro"
-        try:
-            conn = sqlite3.connect(uri, uri=True)
-        except sqlite3.Error as exc:
-            raise AdapterError(
-                f"Scout observer DB could not be opened read-only: {db_path}"
-            ) from exc
-        conn.row_factory = sqlite3.Row
-        try:
+        limit = self.candidate_limit
+        id_cap = MAX_EVIDENCE_IDS_PER_CANDIDATE
+
+        def query(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             try:
                 ranked = conn.execute(
                     """
@@ -312,11 +397,13 @@ class LocalScoutAdapter:
                     ORDER BY evidence_count DESC, did ASC
                     LIMIT ?
                     """,
-                    (self.candidate_limit,),
+                    (limit,),
                 ).fetchall()
             except sqlite3.Error as exc:
+                if _is_sqlite_interrupt(exc):
+                    raise
                 raise AdapterError(
-                    f"Scout observer DB has no readable evidence_records table: {db_path}"
+                    f"Scout sqlite DB has no readable evidence_records table: {db_path}"
                 ) from exc
             records: list[dict[str, Any]] = []
             for row in ranked:
@@ -330,9 +417,11 @@ class LocalScoutAdapter:
                         ORDER BY retrieved_at DESC, evidence_id DESC
                         LIMIT ?
                         """,
-                        (did, MAX_EVIDENCE_IDS_PER_CANDIDATE),
+                        (did, id_cap),
                     ).fetchall()
-                except sqlite3.Error:
+                except sqlite3.Error as exc:
+                    if _is_sqlite_interrupt(exc):
+                        raise
                     evid_rows = []
                 if evid_rows:
                     for evid in evid_rows:
@@ -351,9 +440,127 @@ class LocalScoutAdapter:
                             "evidence_count": int(row["evidence_count"]),
                         }
                     )
-        finally:
-            conn.close()
-        return records
+            return records
+
+        return run_sqlite_readonly(
+            db_path, query, timeout_seconds=self.sqlite_timeout_seconds
+        )
+
+
+def assess_scout_sqlite(
+    db_path: Path | None,
+    *,
+    max_bytes: int = SCOUT_MAX_QUERY_DB_BYTES,
+    role: str = "sqlite",
+) -> dict[str, Any]:
+    """Classify a Scout sqlite file as usable, missing, or oversized warehouse.
+
+    Size is taken from ``stat`` only. The raw observer warehouse is not opened.
+    """
+    if db_path is None:
+        return {
+            "ok": False,
+            "role": role,
+            "path": None,
+            "bytes": None,
+            "oversized": False,
+            "risky": False,
+            "usable": False,
+            "error": f"scout {role} db is not set",
+        }
+    path = db_path.expanduser()
+    if not path.is_file():
+        return {
+            "ok": False,
+            "role": role,
+            "path": str(path),
+            "bytes": None,
+            "oversized": False,
+            "risky": False,
+            "usable": False,
+            "error": f"scout {role} db not found: {path}",
+        }
+    size = path.stat().st_size
+    warehouse_name = path.name == SCOUT_WAREHOUSE_DB_NAME
+    oversized = size > max_bytes
+    if oversized:
+        gib = size / float(1024**3)
+        cap_gib = max_bytes / float(1024**3)
+        kind = "observer warehouse" if warehouse_name or role == "warehouse" else role
+        return {
+            "ok": False,
+            "role": role,
+            "path": str(path),
+            "bytes": size,
+            "oversized": True,
+            "risky": True,
+            "usable": False,
+            "error": (
+                f"Scout {kind} is {gib:.1f}GiB at {path}; max query size is {cap_gib:.1f}GiB. "
+                "Work Exchange will not GROUP BY the raw warehouse. Use scout_evidence_jsonl "
+                "or scout_projection_db (≤1GiB), not observer.sqlite."
+            ),
+        }
+    return {
+        "ok": True,
+        "role": role,
+        "path": str(path),
+        "bytes": size,
+        "oversized": False,
+        "risky": False,
+        "usable": True,
+        "error": None,
+    }
+
+
+def run_sqlite_readonly(
+    db_path: Path,
+    callback: Callable[[sqlite3.Connection], T],
+    *,
+    timeout_seconds: float,
+) -> T:
+    """Open sqlite read-only and run ``callback`` with a wall-clock deadline.
+
+    ``busy_timeout`` only covers lock waits. Long ``GROUP BY`` scans are aborted
+    via ``set_progress_handler`` plus ``Connection.interrupt`` from a timer.
+    """
+    if timeout_seconds <= 0:
+        raise AdapterError("Scout sqlite timeout_seconds must be > 0")
+    uri = f"file:{db_path.resolve()}?mode=ro"
+    busy_seconds = max(0.001, min(float(timeout_seconds), 5.0))
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=busy_seconds)
+    except sqlite3.Error as exc:
+        raise AdapterError(f"Scout sqlite DB could not be opened read-only: {db_path}") from exc
+    conn.row_factory = sqlite3.Row
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    def on_progress() -> int:
+        return 1 if time.monotonic() >= deadline else 0
+
+    conn.set_progress_handler(on_progress, 64)
+    timer = threading.Timer(float(timeout_seconds), conn.interrupt)
+    timer.daemon = True
+    timer.start()
+    try:
+        return callback(conn)
+    except sqlite3.OperationalError as exc:
+        if time.monotonic() >= deadline or _is_sqlite_interrupt(exc):
+            raise AdapterError(
+                f"Scout sqlite query timed out after {timeout_seconds}s ({db_path})"
+            ) from exc
+        raise AdapterError(f"Scout sqlite query failed ({db_path}): {exc}") from exc
+    finally:
+        timer.cancel()
+        conn.set_progress_handler(None, 0)
+        conn.close()
+
+
+def _is_sqlite_interrupt(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    text = str(exc).lower()
+    return "interrupt" in text or "interrupted" in text or "cancelled" in text
 
 
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
