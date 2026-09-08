@@ -6,9 +6,11 @@ import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
+from flop_work_exchange.constants import EXCHANGE_OPERATOR_GROUP, KNOWN_FAMILY_DIDS
 from flop_work_exchange.exceptions import AdapterError
+from flop_work_exchange.identity import is_valid_ed25519_did
 from flop_work_exchange.models import SentinelVerdict
 
 PROMPT_INJECTION = re.compile(
@@ -27,6 +29,27 @@ SUSPICIOUS_URL = re.compile(r"https?://|www\.", re.IGNORECASE)
 SYBIL = re.compile(r"bulk identit|sybil|generate dids", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _MAX_REASON = 200
+_RULE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._:-]{0,80}$")
+_DECISION_MAP = {
+    "ALLOW": "ALLOW",
+    "ALLOWED": "ALLOW",
+    "PERMIT": "ALLOW",
+    "PASS": "ALLOW",
+    "OK": "ALLOW",
+    "REJECT": "REJECT",
+    "DENIED": "REJECT",
+    "DENY": "REJECT",
+    "BLOCK": "REJECT",
+    "BLOCKED": "REJECT",
+    "FAIL": "REJECT",
+    "REVIEW": "REVIEW",
+    "WARN": "REVIEW",
+    "HOLD": "REVIEW",
+    "ESCALATE": "REVIEW",
+}
+_HIGH_RISK = {"high", "critical", "severe", "reject"}
+_MEDIUM_RISK = {"medium", "moderate", "review"}
+_LOW_RISK = {"low", "info", "informational", "none", "allow"}
 
 Importer = Callable[[], Any]
 
@@ -102,17 +125,18 @@ class StubSentinelAdapter:
 
 
 class LocalSentinelAdapter:
-    """Import flop_sentinel (optional extra / path) and map decide/screen.
+    """Import flop_sentinel and map ``policy.decide`` onto SentinelVerdict.
 
-    Expected unpublished library contract (any one is accepted):
+    Real library contract (unpublished ``greg2718/flop-sentinel``):
 
-        flop_sentinel.decide(artifact_type, artifact) -> verdict
-        flop_sentinel.screen(artifact_type, artifact) -> verdict
-        flop_sentinel.Sentinel().decide(...) / .screen(...)
+        normalize artifact → run detectors → flop_sentinel.policy.decide(
+            findings, provenance, affiliation, ...
+        )
 
-    Verdict may be a mapping or object with ``action``, ``signals``, and
-    ``reasons`` / ``findings``. Attacker/artifact text is never copied into
-    findings. Fail closed if the package is missing or the API is unknown.
+    Top-level ``decide(artifact_type, artifact)`` / ``screen`` are **not** the
+    API. Verdict fields: ``risk``, ``decision``, ``signals``, ``findings``.
+    Findings copied into Work Exchange contain **rule ids only** — never
+    artifact/attacker text. Fail closed if the package or API is missing.
     """
 
     kind = "local"
@@ -130,18 +154,31 @@ class LocalSentinelAdapter:
     def probe(self) -> dict[str, Any]:
         try:
             module = self._load_module()
+            _require_policy_decide(module)
+            _require_detectors(module)
         except AdapterError as exc:
             return {"ok": False, "kind": self.kind, "error": str(exc)}
         return {
             "ok": True,
             "kind": self.kind,
             "module": getattr(module, "__name__", "flop_sentinel"),
-            "note": "pure library import; no network; findings redact untrusted text",
+            "api": "flop_sentinel.policy.decide(findings, provenance, affiliation, ...)",
+            "note": "detectors + policy.decide; findings are rule ids only; no network",
         }
 
     def screen(self, artifact_type: str, artifact: dict[str, Any]) -> SentinelVerdict:
         module = self._load_module()
-        raw = _call_sentinel(module, artifact_type, artifact)
+        decide = _require_policy_decide(module)
+        normalized = normalize_sentinel_artifact(artifact_type, artifact)
+        findings = collect_sentinel_findings(module, normalized)
+        provenance = {
+            "source": "flop-work-exchange",
+            "artifact_type": artifact_type,
+            "payment_mode": "paper",
+            "settlement_execution": "DISABLED",
+        }
+        affiliation = _affiliation_from_artifact(artifact)
+        raw = _invoke_policy_decide(decide, findings, provenance, affiliation)
         return verdict_from_sentinel_raw(raw)
 
     def _load_module(self) -> Any:
@@ -162,46 +199,91 @@ class LocalSentinelAdapter:
         return self._module
 
 
+def normalize_sentinel_artifact(artifact_type: str, artifact: dict[str, Any]) -> dict[str, Any]:
+    """Structured detector input. Raw field text is for detection only."""
+    text_fields = {
+        str(key): str(value) for key, value in artifact.items() if isinstance(value, str)
+    }
+    return {
+        "artifact_type": artifact_type,
+        "field_names": sorted(str(key) for key in artifact.keys()),
+        "dids": _extract_dids(artifact),
+        "text_fields": text_fields,
+        "artifact": dict(artifact),
+    }
+
+
+def collect_sentinel_findings(module: Any, normalized: dict[str, Any]) -> list[Any]:
+    detectors = _require_detectors(module)
+    for name in ("run", "detect", "collect", "run_all", "scan", "evaluate"):
+        fn = getattr(detectors, name, None)
+        if callable(fn):
+            return _as_list(fn(normalized))
+    for registry_name in ("DETECTORS", "ALL", "REGISTRY"):
+        registry = getattr(detectors, registry_name, None)
+        if registry:
+            findings: list[Any] = []
+            for item in registry:
+                fn = item if callable(item) else getattr(item, "detect", None) or getattr(
+                    item, "run", None
+                )
+                if callable(fn):
+                    findings.extend(_as_list(fn(normalized)))
+            return findings
+    collected: list[Any] = []
+    found_any = False
+    for name in dir(detectors):
+        if name.startswith("_"):
+            continue
+        obj = getattr(detectors, name)
+        if callable(obj) and (name.startswith("detect") or name.endswith("_detector")):
+            found_any = True
+            collected.extend(_as_list(obj(normalized)))
+    if found_any:
+        return collected
+    raise AdapterError(
+        "flop_sentinel.detectors has no run/detect/DETECTORS entry point; fail closed"
+    )
+
+
 def verdict_from_sentinel_raw(raw: Any) -> SentinelVerdict:
     if isinstance(raw, SentinelVerdict):
         return SentinelVerdict(
             action=raw.action,
-            signals=list(raw.signals),
-            reasons=sanitize_sentinel_reasons(list(raw.reasons)),
+            signals=_safe_signals(list(raw.signals)),
+            reasons=rule_ids_only(list(raw.reasons)),
             fail_closed=True,
         )
-    action: Any
-    signals: list[str]
-    reasons: list[str]
-    if isinstance(raw, dict):
-        action = raw.get("action") or raw.get("verdict")
-        signals = [str(item) for item in (raw.get("signals") or [])]
-        reasons = [str(item) for item in (raw.get("reasons") or raw.get("findings") or [])]
-    elif hasattr(raw, "action"):
-        action = getattr(raw, "action", None)
-        signals = [str(item) for item in (getattr(raw, "signals", None) or [])]
-        reasons = [
-            str(item)
-            for item in (
-                getattr(raw, "reasons", None) or getattr(raw, "findings", None) or []
-            )
-        ]
-    else:
-        raise AdapterError("flop_sentinel returned an unrecognized verdict shape")
-    normalized = str(action or "").upper()
-    if normalized not in {"ALLOW", "REJECT", "REVIEW"}:
-        return SentinelVerdict(
-            action="REJECT",
-            signals=signals or ["unknown_verdict"],
-            reasons=sanitize_sentinel_reasons(
-                reasons or [f"unrecognized sentinel action {action!r}; fail closed"]
-            ),
-        )
+    decision, risk, signals, findings = _unpack_verdict(raw)
+    action = _map_decision(decision, risk)
+    reasons = rule_ids_only(findings)
+    risk_token = _safe_token(risk)
+    if risk_token and f"risk:{risk_token}" not in reasons:
+        reasons.append(f"risk:{risk_token}")
+    if not reasons:
+        reasons = [f"decision:{action.lower()}"]
     return SentinelVerdict(
-        action=normalized,  # type: ignore[arg-type]
-        signals=signals,
-        reasons=sanitize_sentinel_reasons(reasons or [normalized.lower()]),
+        action=action,
+        signals=_safe_signals(signals),
+        reasons=reasons,
+        fail_closed=True,
     )
+
+
+def rule_ids_only(findings: list[Any]) -> list[str]:
+    """Map Sentinel findings to rule ids. Never paste artifact text."""
+    ids: list[str] = []
+    omitted = False
+    for item in findings:
+        rule_id = _finding_rule_id(item)
+        if rule_id:
+            if rule_id not in ids:
+                ids.append(rule_id)
+            continue
+        omitted = True
+    if omitted and "untrusted artifact text omitted from findings" not in ids:
+        ids.append("untrusted artifact text omitted from findings")
+    return sanitize_sentinel_reasons(ids)
 
 
 def sanitize_sentinel_reasons(reasons: list[str]) -> list[str]:
@@ -227,21 +309,142 @@ def sanitize_sentinel_reasons(reasons: list[str]) -> list[str]:
     return cleaned or ["sentinel verdict"]
 
 
-def _call_sentinel(module: Any, artifact_type: str, artifact: dict[str, Any]) -> Any:
-    for name in ("decide", "screen"):
-        fn = getattr(module, name, None)
-        if callable(fn):
-            return fn(artifact_type, artifact)
-    sentinel_cls = getattr(module, "Sentinel", None)
-    if callable(sentinel_cls):
-        instance = sentinel_cls()
-        for name in ("decide", "screen"):
-            fn = getattr(instance, name, None)
-            if callable(fn):
-                return fn(artifact_type, artifact)
-    raise AdapterError(
-        "flop_sentinel has no decide/screen function or Sentinel().decide/screen method"
-    )
+def _require_policy_decide(module: Any) -> Any:
+    policy = getattr(module, "policy", None)
+    decide = getattr(policy, "decide", None) if policy is not None else None
+    if not callable(decide):
+        raise AdapterError(
+            "flop_sentinel.policy.decide is missing. LocalSentinelAdapter requires "
+            "detectors + policy.decide(findings, provenance, affiliation, ...); "
+            "top-level decide(artifact_type, artifact)/screen is not the library API."
+        )
+    return decide
+
+
+def _require_detectors(module: Any) -> Any:
+    detectors = getattr(module, "detectors", None)
+    if detectors is None:
+        raise AdapterError(
+            "flop_sentinel.detectors is missing; LocalSentinelAdapter requires "
+            "detectors then policy.decide"
+        )
+    return detectors
+
+
+def _invoke_policy_decide(
+    decide: Any,
+    findings: list[Any],
+    provenance: dict[str, Any],
+    affiliation: dict[str, Any],
+) -> Any:
+    try:
+        return decide(findings, provenance=provenance, affiliation=affiliation)
+    except TypeError:
+        try:
+            return decide(findings, provenance, affiliation)
+        except TypeError:
+            try:
+                return decide(findings)
+            except TypeError as exc:
+                raise AdapterError(
+                    "flop_sentinel.policy.decide rejected findings/provenance/affiliation"
+                ) from exc
+
+
+def _unpack_verdict(raw: Any) -> tuple[Any, Any, list[Any], list[Any]]:
+    if isinstance(raw, dict):
+        decision = raw.get("decision") or raw.get("action") or raw.get("verdict")
+        risk = raw.get("risk")
+        signals = list(raw.get("signals") or [])
+        findings = list(raw.get("findings") or raw.get("reasons") or [])
+        return decision, risk, signals, findings
+    if raw is None:
+        raise AdapterError("flop_sentinel.policy.decide returned no verdict; fail closed")
+    decision = getattr(raw, "decision", None) or getattr(raw, "action", None)
+    risk = getattr(raw, "risk", None)
+    signals = list(getattr(raw, "signals", None) or [])
+    findings = list(getattr(raw, "findings", None) or getattr(raw, "reasons", None) or [])
+    if decision is None and risk is None and not signals and not findings:
+        raise AdapterError("flop_sentinel returned an unrecognized verdict shape")
+    return decision, risk, signals, findings
+
+
+def _map_decision(decision: Any, risk: Any) -> Literal["ALLOW", "REJECT", "REVIEW"]:
+    token = str(decision or "").strip().upper()
+    mapped = _DECISION_MAP.get(token)
+    if mapped in {"ALLOW", "REJECT", "REVIEW"}:
+        return cast(Literal["ALLOW", "REJECT", "REVIEW"], mapped)
+    risk_token = str(risk or "").strip().lower()
+    if risk_token in _HIGH_RISK:
+        return "REJECT"
+    if risk_token in _MEDIUM_RISK:
+        return "REVIEW"
+    if risk_token in _LOW_RISK and not token:
+        return "ALLOW"
+    return "REJECT"
+
+
+def _finding_rule_id(item: Any) -> str | None:
+    if isinstance(item, str):
+        token = item.strip()
+        return token if _RULE_ID_RE.fullmatch(token) else None
+    if isinstance(item, dict):
+        for key in ("rule_id", "id", "rule", "code"):
+            value = item.get(key)
+            if isinstance(value, str) and _RULE_ID_RE.fullmatch(value.strip()):
+                return value.strip()
+        return None
+    for attr in ("rule_id", "id", "rule", "code"):
+        value = getattr(item, attr, None)
+        if isinstance(value, str) and _RULE_ID_RE.fullmatch(value.strip()):
+            return value.strip()
+    return None
+
+
+def _safe_signals(signals: list[Any]) -> list[str]:
+    out: list[str] = []
+    for item in signals:
+        token = _safe_token(item)
+        if token and token not in out:
+            out.append(token)
+    return out
+
+
+def _safe_token(value: Any) -> str | None:
+    if value is None:
+        return None
+    token = str(value).strip().replace(" ", "_")
+    if not token or not _RULE_ID_RE.fullmatch(token):
+        return None
+    return token
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _extract_dids(artifact: dict[str, Any]) -> list[str]:
+    dids: list[str] = []
+    for value in artifact.values():
+        if isinstance(value, str) and is_valid_ed25519_did(value) and value not in dids:
+            dids.append(value)
+    return dids
+
+
+def _affiliation_from_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    dids = _extract_dids(artifact)
+    family = [did for did in dids if did in KNOWN_FAMILY_DIDS]
+    return {
+        "operator_group": EXCHANGE_OPERATOR_GROUP,
+        "known_family_dids": family,
+        "relationship": "same_operator" if family else "unknown",
+    }
 
 
 def _prepare_sys_path(module_path: Path | None) -> None:

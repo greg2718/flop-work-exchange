@@ -22,6 +22,7 @@ from flop_work_exchange.constants import (
     MAC_ROUTER_REPO,
     MAC_SCOUT_REPO,
     MAC_SENTINEL_REPO,
+    ROUTER_FIXTURE_RELATIVE,
 )
 
 
@@ -44,7 +45,7 @@ def resolve_adapters(config: AdapterConfig) -> AdapterBundle:
 
 def _resolve_scout(config: AdapterConfig) -> StubScoutAdapter | LocalScoutAdapter:
     if config.scout_mode != "local":
-        return StubScoutAdapter()
+        return StubScoutAdapter(candidate_limit=config.scout_candidate_limit)
     script = first_existing_file(
         config.scout_script,
         (config.scout_repo / "flop_scout.py") if config.scout_repo else None,
@@ -63,6 +64,7 @@ def _resolve_scout(config: AdapterConfig) -> StubScoutAdapter | LocalScoutAdapte
         db_path=db_path,
         evidence_jsonl=config.scout_evidence_jsonl,
         timeout_seconds=config.timeout_seconds,
+        candidate_limit=config.scout_candidate_limit,
     )
 
 
@@ -85,13 +87,28 @@ def _resolve_router(config: AdapterConfig) -> StubRouterAdapter | LocalRouterAda
         MAC_ROUTER_REPO / "router.py",
     )
     cwd = config.router_repo or (script.parent if script is not None else None)
+    fixture_path, db_path = _resolve_router_evidence(config)
     return LocalRouterAdapter(
         script=script,
         python=config.python,
-        db_path=config.router_db,
+        db_path=db_path,
+        fixture_path=fixture_path,
         cwd=cwd,
         timeout_seconds=config.timeout_seconds,
     )
+
+
+def _resolve_router_evidence(config: AdapterConfig) -> tuple[Path | None, Path | None]:
+    """Explicit fixture or db wins; otherwise the bundled flop-router fixture."""
+    if config.router_fixture is not None:
+        return config.router_fixture.expanduser(), None
+    if config.router_db is not None:
+        return None, config.router_db.expanduser()
+    bundled = first_existing_file(
+        (config.router_repo / ROUTER_FIXTURE_RELATIVE) if config.router_repo else None,
+        MAC_ROUTER_REPO / ROUTER_FIXTURE_RELATIVE,
+    )
+    return bundled, None
 
 
 def _resolve_sentinel(config: AdapterConfig) -> StubSentinelAdapter | LocalSentinelAdapter:

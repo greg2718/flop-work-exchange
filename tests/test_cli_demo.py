@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,52 @@ def test_cli_doctor_and_live_demo(
     assert payload["ok"] is True
     assert payload["receipt"]["payment_mode"] == "paper"
     assert payload["adapter_kinds"]["scout"] == "stub"
+
+
+def test_cli_doctor_reads_yaml_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in list(os.environ):
+        if key.startswith("FLOP_WX_") or key == "FLOP_SCOUT_STATE_DIR":
+            monkeypatch.delenv(key, raising=False)
+    yaml_path = tmp_path / "ops.yaml"
+    yaml_path.write_text(
+        """
+payment_mode: paper
+adapters:
+  scout_mode: local
+  bench_mode: stub
+  router_mode: stub
+  sentinel_mode: stub
+""",
+        encoding="utf-8",
+    )
+    assert main(["--config", str(yaml_path), "doctor"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["adapter_modes"]["scout"] == "local"
+    assert report["adapter_modes"]["bench"] == "stub"
+    assert report["config_path"] == str(yaml_path)
+
+    monkeypatch.setenv("FLOP_WX_SCOUT_MODE", "stub")
+    assert main(["--config", str(yaml_path), "doctor"]) == 0
+    overridden = json.loads(capsys.readouterr().out)
+    assert overridden["adapter_modes"]["scout"] == "stub"
+
+
+def test_cli_live_demo_nonzero_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "flop_work_exchange.cli.run_live_demo",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "verification": {"ok": True},
+            "adapter_errors": ["scout: warehouse exploded"],
+        },
+    )
+    assert main(["live-demo", "--state-dir", str(tmp_path)]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
 
 
 def test_help_lists_required_commands() -> None:

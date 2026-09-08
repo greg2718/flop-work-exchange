@@ -102,9 +102,9 @@ missing — stub success is never labeled as live.
 
 | Adapter | Sibling | Stub behavior | Local wiring |
 | --- | --- | --- | --- |
-| Scout | [flop-scout](https://github.com/greg2718/flop-scout) | Reads optional local evidence JSONL; never opens a network socket | Tries `python flop_scout.py evidence feed --since-id 0 --format jsonl`; falls back to read-only `observer.sqlite` `evidence_records` |
-| Router | [flop-router](https://github.com/greg2718/flop-router) | Lowest in-budget offer → Router decision document | Subprocess `router.py decision create --output …`; maps `work_route` / plans; forces `SIMULATION_ONLY` / `DISABLED` |
-| Sentinel | local `flop_sentinel` (not published) | Artifact in → `ALLOW` / `REVIEW` / `REJECT`; fail-closed | Import `flop_sentinel` (`pip install -e ".[live]"` plus a local checkout, or `FLOP_WX_SENTINEL_PATH`); findings omit attacker text |
+| Scout | [flop-scout](https://github.com/greg2718/flop-scout) | Reads optional local evidence JSONL; never opens a network socket | Tries `python flop_scout.py evidence feed --since-id 0 --format jsonl`; falls back to read-only `observer.sqlite` `evidence_records`. Caps candidates (default 25, ranked by evidence count) |
+| Router | [flop-router](https://github.com/greg2718/flop-router) | Lowest in-budget offer → Router decision document | Subprocess `router.py [--db projection] decision create --output … [--fixture …]`; maps `work_route` / plans; forces `SIMULATION_ONLY` / `DISABLED`. Probe fails closed unless a ≤1GiB db or fixture is usable |
+| Sentinel | local `flop_sentinel` (not published) | Artifact in → `ALLOW` / `REVIEW` / `REJECT`; fail-closed | Import `flop_sentinel` (`pip install -e ".[live]"` plus a local checkout, or `FLOP_WX_SENTINEL_PATH`); normalize artifact → detectors → `policy.decide(findings, provenance, affiliation, …)`; findings are rule ids only |
 | Bench | [flop-bench](https://github.com/greg2718/flop-bench) | Checks `result_hash == sha256(result_text)`; no local exec | Generates a passive spec and runs `flop-bench verify --state-dir <temp>`; `--allow-local-exec` only if explicitly enabled |
 | TCLK | Router TCLK observations | Records `tclk-paper-*` deal ids | Still simulation until a live rail exists |
 | Settlement | n/a | `PaperSettlement` ledger debit/credit | `TestnetSettlement` always raises `NotLiveError` |
@@ -148,6 +148,15 @@ temp `--state-dir` and must not write into `~/.flop_agents/bench`.
 
 ### Selecting local adapters
 
+Pass the YAML so `doctor` / `live-demo` load the same AdapterConfig path as
+other commands. `FLOP_WX_*` environment variables still override file values
+when set.
+
+```bash
+flop-work-exchange --config examples/live-ops.yaml doctor
+flop-work-exchange --config examples/live-ops.yaml --state-dir /tmp/wx-live live-demo
+```
+
 Environment (overrides `examples/live-ops.yaml`):
 
 ```bash
@@ -157,17 +166,23 @@ export FLOP_WX_ROUTER_MODE=local
 export FLOP_WX_SENTINEL_MODE=local
 export FLOP_WX_SCOUT_REPO=~/dev/flop_scout_v02
 export FLOP_SCOUT_STATE_DIR=~/.flop_scout
+export FLOP_WX_SCOUT_CANDIDATE_LIMIT=25
 export FLOP_WX_BENCH_REPO=~/dev/flop_bench
 export FLOP_WX_BENCH_ALLOW_LOCAL_EXEC=false   # default; do not enable casually
 export FLOP_WX_ROUTER_REPO=~/dev/flop-router
+# Live Router: a Scout→Router projection ≤1GiB (V2). Do not pass the raw
+# Scout observer.sqlite warehouse (~52GiB); Router V1 max is 1GiB.
+export FLOP_WX_ROUTER_DB=/path/to/router-projection.sqlite
+# Synthetic paper-ops (flop-router bundled fixture) when no projection exists:
+export FLOP_WX_ROUTER_FIXTURE=~/dev/flop-router/fixtures/evidence_consistency.jsonl
 export FLOP_WX_SENTINEL_PATH=~/dev/flop_sentinel
 ```
 
-Or `--config examples/live-ops.yaml`. Stubs remain the default when modes are
-unset, so CI stays offline.
+Stubs remain the default when modes are unset, so CI stays offline.
 
 If a local backend is missing, the adapter raises `AdapterError` instead of
-returning stub success labeled as live.
+returning stub success labeled as live. `doctor` and `live-demo` now read
+`--config` (YAML/JSON/TOML) the same way as other commands.
 
 Scout CLI contract (tried first; Scout v0.3.3 does not yet implement `feed`):
 
@@ -175,16 +190,32 @@ Scout CLI contract (tried first; Scout v0.3.3 does not yet implement `feed`):
 python flop_scout.py evidence feed --since-id 0 --format jsonl
 ```
 
-Local fallback: read-only `evidence_records` in `observer.sqlite`. Scout
-`observe` / `read` / `say` are never invoked (those use the network).
+Local fallback: read-only `evidence_records` in `observer.sqlite`, grouped by
+DID and ranked by evidence count. Output is capped (default 25; never dump the
+warehouse into demo/CLI stdout). Scout `observe` / `read` / `say` are never
+invoked (those use the network).
 
-Router CLI contract:
+Router CLI contract (`--db` is a parent-parser flag, before `decision`):
 
 ```bash
-python router.py decision create "<task>" --output /tmp/wx-router-decision.json \
+python router.py --db /path/to/router-projection.sqlite decision create "<task>" \
+  --output /tmp/wx-router-decision.json \
   --job-id FLOP-JOB-... --job-proto flop-work-exchange.job.v0.1 \
   --verification-mode OBJECTIVE_BENCH --asset FLOP --max-amount <budget_micro>
 ```
+
+Synthetic fixture mode (paper ops / public clone):
+
+```bash
+python router.py decision create "<task>" \
+  --fixture fixtures/evidence_consistency.jsonl \
+  --output /tmp/wx-router-decision.json
+```
+
+**Router projection note:** production live Router requires a Scout→Router
+projection ≤1GiB (V2), not the raw Scout warehouse. A local-mode probe fails
+closed with a clear message if neither a usable db (exists, ≤1GiB) nor a
+fixture file is present.
 
 `flop-router` is a single-file script, not an importable package. The wrapper
 maps `work_route` / `settlement_plan` / `verification_plan` / `security_policy`
@@ -193,21 +224,27 @@ DID with no offer, the plan is `DISQUALIFIED` rather than substituting a stub
 offer.
 
 Sentinel: `pip install -e ".[live]"` then install a local `flop_sentinel`
-checkout. Expected API: `decide` or `screen` (module or `Sentinel()`).
+checkout. The library is unpublished (`greg2718/flop-sentinel` is not a public
+clone target). Contract: run detectors on a normalized artifact, then
+`flop_sentinel.policy.decide(findings, provenance, affiliation, ...)`. The
+mapped `Verdict` uses `risk` / `decision` / `signals` / `findings` (rule ids
+only). Top-level `decide(artifact_type, artifact)` / `screen` is not the API.
 
 ### Doctor and live-demo
 
 ```bash
-flop-work-exchange doctor
-flop-work-exchange --state-dir /tmp/wx doctor
-flop-work-exchange live-demo --state-dir /tmp/wx-live
+flop-work-exchange --config examples/live-ops.yaml doctor
+flop-work-exchange --state-dir /tmp/wx --config examples/live-ops.yaml doctor
+flop-work-exchange --config examples/live-ops.yaml --state-dir /tmp/wx-live live-demo
 ```
 
 `doctor` reports adapter modes, path probes, identity (public metadata only),
-and isolation. `live-demo` runs one paper job, preferring local adapters that
-probe OK and falling back to stubs with explicit `adapter_notes`. It uses
-ephemeral demo DIDs (not family DIDs) so same-operator Scout/Bench/Router
-identities are not presented as independent workers.
+and isolation. It loads AdapterConfig from `--config` when given. `live-demo`
+runs one paper job, preferring local adapters that probe OK and falling back
+to stubs with explicit `adapter_notes`. Mid-run adapter errors set `"ok": false`
+and a **non-zero** process exit even if a stub fallback still produces a
+receipt. It uses ephemeral demo DIDs (not family DIDs) so same-operator
+Scout/Bench/Router identities are not presented as independent workers.
 
 
 ## Paper → testnet switch
@@ -273,8 +310,8 @@ flop-work-exchange --state-dir /tmp/wx verify --job-id FLOP-JOB-...
 flop-work-exchange --state-dir /tmp/wx settle --job-id FLOP-JOB-...
 flop-work-exchange --state-dir /tmp/wx show-receipt --job-id FLOP-JOB-...
 python -m flop_work_exchange demo --state-dir /tmp/wx-demo
-flop-work-exchange doctor
-flop-work-exchange live-demo --state-dir /tmp/wx-live
+flop-work-exchange --config examples/live-ops.yaml doctor
+flop-work-exchange --config examples/live-ops.yaml --state-dir /tmp/wx-live live-demo
 ```
 
 ## Related agents

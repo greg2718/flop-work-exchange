@@ -14,6 +14,7 @@ from flop_work_exchange.config import AdapterConfig, ExchangeConfig, PolicyConfi
 from flop_work_exchange.constants import (
     BENCH_STATE,
     DEFAULT_PRODUCTION_STATE,
+    DEFAULT_SCOUT_CANDIDATE_LIMIT,
     LEGACY_SCOUT_STATE,
     MAC_BENCH_REPO,
     MAC_ROUTER_REPO,
@@ -39,6 +40,7 @@ def doctor(
     *,
     state_dir: Path | None = None,
     adapter_config: AdapterConfig | None = None,
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     adapters = adapter_config or AdapterConfig()
     bundle = resolve_adapters(adapters)
@@ -119,6 +121,10 @@ def doctor(
             "router": adapters.router_mode,
             "sentinel": adapters.sentinel_mode,
         },
+        "config_path": str(config_path) if config_path is not None else None,
+        "scout_candidate_limit": adapters.scout_candidate_limit,
+        "router_db": str(adapters.router_db) if adapters.router_db else None,
+        "router_fixture": str(adapters.router_fixture) if adapters.router_fixture else None,
         "checks": checks,
     }
 
@@ -127,10 +133,12 @@ def run_live_demo(
     state_dir: Path,
     *,
     adapter_config: AdapterConfig | None = None,
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run one paper job, preferring local adapters that actually probe OK."""
     requested = adapter_config or AdapterConfig()
     notes: list[str] = []
+    mid_run_errors: list[str] = []
     bundle = resolve_adapters(requested)
     scout, notes = _prefer_local(
         "scout", requested.scout_mode, bundle.scout, StubScoutAdapter(), notes
@@ -171,6 +179,8 @@ def run_live_demo(
     try:
         candidates = exchange.find_candidates(job.job_id)
     except AdapterError as exc:
+        if getattr(exchange.scout, "kind", "") == "local":
+            mid_run_errors.append(f"scout: {exc}")
         notes.append(f"scout: local find_candidates failed ({exc}); falling back to stub")
         exchange.scout = StubScoutAdapter()
         candidates = exchange.find_candidates(job.job_id)
@@ -180,7 +190,14 @@ def run_live_demo(
         price_flop="12",
         notes="paper live-demo worker offer",
     )
-    plan = exchange.route_job(job.job_id)
+    try:
+        plan = exchange.route_job(job.job_id)
+    except AdapterError as exc:
+        if getattr(exchange.router, "kind", "") == "local":
+            mid_run_errors.append(f"router: {exc}")
+        notes.append(f"router: local plan failed ({exc}); falling back to stub router")
+        exchange.router = StubRouterAdapter()
+        plan = exchange.route_job(job.job_id)
     if plan.qualification != "QUALIFIED_PLAN" or plan.selected_offer_id != offer.offer_id:
         notes.append(
             "router: local/live plan did not select the demo offer "
@@ -197,6 +214,8 @@ def run_live_demo(
     try:
         exchange.verify(job.job_id)
     except AdapterError as exc:
+        if getattr(exchange.bench, "kind", "") == "local":
+            mid_run_errors.append(f"bench: {exc}")
         notes.append(f"bench: local verify failed ({exc}); falling back to stub")
         exchange.bench = StubBenchAdapter()
         job_row = exchange.store.load_job(job.job_id)
@@ -207,9 +226,13 @@ def run_live_demo(
     payload = receipt.to_dict()
     verification = verify_receipt(payload)
     seller_profile = exchange.store.load_profile(seller_did).public_claims()
+    limit = requested.scout_candidate_limit or DEFAULT_SCOUT_CANDIDATE_LIMIT
+    candidate_dids = [candidate.did for candidate in candidates[:limit]]
+    ok = bool(verification.get("ok")) and not mid_run_errors
     return {
-        "ok": True,
+        "ok": ok,
         "state_dir": str(state_dir),
+        "config_path": str(config_path) if config_path is not None else None,
         "exchange_did": exchange.exchange_did(),
         "buyer_did": buyer_did,
         "seller_did": seller_did,
@@ -219,7 +242,9 @@ def run_live_demo(
         "tclk_deal_id": deal.tclk_deal_id,
         "operator_relationship": deal.operator_relationship,
         "independent_reputation_eligible": deal.independent_reputation_eligible,
-        "candidates_from_scout": [candidate.did for candidate in candidates],
+        "candidates_from_scout": candidate_dids,
+        "candidates_shown": len(candidate_dids),
+        "candidates_limit": limit,
         "router_qualification": plan.qualification,
         "receipt_path": str(receipt_path),
         "receipt": payload,
@@ -236,6 +261,7 @@ def run_live_demo(
             "sentinel": getattr(exchange.sentinel, "kind", "unknown"),
         },
         "adapter_notes": notes,
+        "adapter_errors": mid_run_errors,
         "not_live": ["faucet", "wallet", "token transfer", "settlement_execution"],
     }
 
