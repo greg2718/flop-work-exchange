@@ -234,7 +234,8 @@ a public clone target). Real contract:
 - `provenance` / `affiliation` are `flop_sentinel.models` enums, not dicts.
   Paper/local artifacts map to `Provenance.UNSIGNED` (unsigned paper jobs, not
   a made-up `LOCAL` token). Affiliation uses a real `Affiliation` member
-  (`UNKNOWN` / `FAMILY` / `SAME_OPERATOR`, …). Unknown tokens fail closed.
+  (`UNKNOWN` or `SELF_OPERATED` for family/same-operator peers). Unknown tokens
+  fail closed.
 - `policy` / `detectors` / `models` are submodules — import them; do not use
   `getattr(flop_sentinel, "policy")` (empty `__init__.py` does not re-export).
 - Mapped `Verdict` → `ALLOW` / `REJECT` / `REVIEW` with **rule ids only**.

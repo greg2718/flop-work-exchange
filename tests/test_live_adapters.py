@@ -288,14 +288,13 @@ def _real_shaped_sentinel_module(
     """Minimal flop_sentinel contract: policy.decide + ALL_DETECTORS + typed models."""
 
     class DefaultProvenance(Enum):
-        SIGNED_VALID = "signed_valid"
+        SIGNED_VERIFIED = "signed_verified"
         SIGNED_INVALID = "signed_invalid"
         UNSIGNED = "unsigned"
         MALFORMED = "malformed"
 
     class DefaultAffiliation(Enum):
-        SAME_OPERATOR = "same_operator"
-        FAMILY = "family"
+        SELF_OPERATED = "self_operated"
         UNKNOWN = "unknown"
 
     Provenance = provenance_cls or DefaultProvenance
@@ -390,14 +389,13 @@ from enum import Enum
 from dataclasses import dataclass
 
 class Provenance(Enum):
-    SIGNED_VALID = "signed_valid"
+    SIGNED_VERIFIED = "signed_verified"
     SIGNED_INVALID = "signed_invalid"
     UNSIGNED = "unsigned"
     MALFORMED = "malformed"
 
 class Affiliation(Enum):
-    SAME_OPERATOR = "same_operator"
-    FAMILY = "family"
+    SELF_OPERATED = "self_operated"
     UNKNOWN = "unknown"
 
 class Decision(Enum):
@@ -527,7 +525,7 @@ def test_local_sentinel_maps_typed_decide_and_all_detectors() -> None:
     assert clean.action == "ALLOW"
 
     adapter.screen("offer", {"seller_did": FAMILY_SCOUT, "notes": "ok"})
-    assert captured["affiliation"].name == "SAME_OPERATOR"
+    assert captured["affiliation"].name == "SELF_OPERATED"
     assert isinstance(captured["affiliation"], Enum)
 
 
@@ -541,7 +539,7 @@ def test_local_sentinel_maps_paper_artifact_to_unsigned_provenance() -> None:
     affiliation_cls = module.models.Affiliation
     assert not hasattr(provenance_cls, "LOCAL")
     assert {member.name for member in provenance_cls} == {
-        "SIGNED_VALID",
+        "SIGNED_VERIFIED",
         "SIGNED_INVALID",
         "UNSIGNED",
         "MALFORMED",
@@ -559,15 +557,26 @@ def test_local_sentinel_maps_paper_artifact_to_unsigned_provenance() -> None:
 
 def test_local_sentinel_maps_family_did_to_real_affiliation_member() -> None:
     class Affiliation(Enum):
-        FAMILY = "family"
+        SELF_OPERATED = "self_operated"
         UNKNOWN = "unknown"
 
     module, captured = _real_shaped_sentinel_module(affiliation_cls=Affiliation)
     LocalSentinelAdapter(importer=lambda: module).screen(
         "offer", {"seller_did": FAMILY_SCOUT, "notes": "ok"}
     )
-    assert captured["affiliation"] is Affiliation.FAMILY
+    assert captured["affiliation"] is Affiliation.SELF_OPERATED
     assert captured["affiliation"].name != "LOCAL"
+
+    LocalSentinelAdapter(importer=lambda: module).screen(
+        "job", {"outcome": "paper summary"}
+    )
+    assert captured["affiliation"] is Affiliation.UNKNOWN
+
+    LocalSentinelAdapter(importer=lambda: module).screen(
+        "offer",
+        {"seller_did": fresh_dids()[1], "operator_relationship": "same_operator"},
+    )
+    assert captured["affiliation"] is Affiliation.SELF_OPERATED
 
 
 def test_local_sentinel_prefers_unsigned_even_when_local_alias_exists() -> None:
@@ -584,7 +593,7 @@ def test_local_sentinel_prefers_unsigned_even_when_local_alias_exists() -> None:
 
 def test_local_sentinel_fail_closed_on_unknown_provenance_tokens() -> None:
     class Provenance(Enum):
-        SIGNED_VALID = "signed_valid"
+        SIGNED_VERIFIED = "signed_verified"
         SIGNED_INVALID = "signed_invalid"
         MALFORMED = "malformed"
 
