@@ -5,6 +5,7 @@ from typing import Any
 
 from flop_work_exchange.adapters import BenchAdapter, RouterAdapter, ScoutAdapter, SentinelAdapter
 from flop_work_exchange.adapters.factory import resolve_adapters
+from flop_work_exchange.adapters.scout import cap_worker_candidates
 from flop_work_exchange.adapters.settlement import PaperSettlement, TestnetSettlement
 from flop_work_exchange.adapters.tclk import StubTclkAdapter
 from flop_work_exchange.amounts import micro_to_flop_string, parse_flop_to_micro
@@ -139,9 +140,11 @@ class WorkExchange:
     def list_jobs(self) -> list[Job]:
         return self.store.list_jobs()
 
-    def find_candidates(self, job_id: str) -> list[WorkerCandidate]:
+    def find_candidates(self, job_id: str, *, limit: int | None = None) -> list[WorkerCandidate]:
         job = self.store.load_job(job_id)
-        return self.scout.find_candidates(job)
+        found = self.scout.find_candidates(job)
+        cap = self.config.adapters.scout_candidate_limit if limit is None else limit
+        return cap_worker_candidates(found, cap)
 
     def submit_offer(
         self,

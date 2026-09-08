@@ -23,7 +23,14 @@ adapters:
   sentinel_mode: local
   scout_repo: ~/dev/flop_scout_v02
   scout_state_dir: ~/.flop_scout
+  scout_candidate_limit: 25
   bench_repo: ~/dev/flop_bench
   bench_allow_local_exec: false
   router_repo: ~/dev/flop-router
+  # Production live Router needs a Scout→Router projection ≤1GiB (V2),
+  # not the raw Scout observer.sqlite warehouse (~52GiB). Router V1
+  # consumer max is 1GiB.
+  # router_db: /path/to/router-projection.sqlite
+  # Synthetic paper-ops fixture bundled with flop-router:
+  router_fixture: ~/dev/flop-router/fixtures/evidence_consistency.jsonl
   sentinel_path: ~/dev/flop_sentinel

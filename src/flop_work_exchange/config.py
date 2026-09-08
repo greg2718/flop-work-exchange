@@ -12,8 +12,10 @@ import yaml
 from flop_work_exchange.amounts import parse_micro
 from flop_work_exchange.canonical import atomic_write_json
 from flop_work_exchange.constants import (
+    DEFAULT_SCOUT_CANDIDATE_LIMIT,
     EXCHANGE_OPERATOR_GROUP,
     KNOWN_FAMILY_DIDS,
+    MAX_SCOUT_CANDIDATE_LIMIT,
     assert_isolated_state_dir,
 )
 from flop_work_exchange.exceptions import ValidationError
@@ -69,6 +71,16 @@ def _adapter_mode(value: Any, label: str) -> AdapterMode:
     return mode  # type: ignore[return-value]
 
 
+def _candidate_limit(value: Any, label: str) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{label} must be an integer") from exc
+    if limit < 1:
+        raise ValidationError(f"{label} must be >= 1")
+    return min(limit, MAX_SCOUT_CANDIDATE_LIMIT)
+
+
 def _env_flag(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None:
@@ -96,8 +108,10 @@ class AdapterConfig:
     router_repo: Path | None = None
     router_script: Path | None = None
     router_db: Path | None = None
+    router_fixture: Path | None = None
     sentinel_path: Path | None = None
     timeout_seconds: float = 30.0
+    scout_candidate_limit: int = DEFAULT_SCOUT_CANDIDATE_LIMIT
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -119,8 +133,10 @@ class AdapterConfig:
             "router_repo": str(self.router_repo) if self.router_repo else None,
             "router_script": str(self.router_script) if self.router_script else None,
             "router_db": str(self.router_db) if self.router_db else None,
+            "router_fixture": str(self.router_fixture) if self.router_fixture else None,
             "sentinel_path": str(self.sentinel_path) if self.sentinel_path else None,
             "timeout_seconds": self.timeout_seconds,
+            "scout_candidate_limit": self.scout_candidate_limit,
         }
 
 
@@ -260,13 +276,30 @@ def adapter_config_from_mapping(raw: Any | None) -> AdapterConfig:
         router_repo=_optional_path(mapping.get("router_repo")),
         router_script=_optional_path(mapping.get("router_script")),
         router_db=_optional_path(mapping.get("router_db")),
+        router_fixture=_optional_path(mapping.get("router_fixture")),
         sentinel_path=_optional_path(mapping.get("sentinel_path")),
         timeout_seconds=timeout,
+        scout_candidate_limit=_candidate_limit(
+            mapping.get("scout_candidate_limit", DEFAULT_SCOUT_CANDIDATE_LIMIT),
+            "adapters.scout_candidate_limit",
+        ),
     )
 
 
 def adapter_config_from_env() -> AdapterConfig:
     return overlay_adapter_env(AdapterConfig())
+
+
+def load_adapter_config(config_path: Path | None = None) -> AdapterConfig:
+    """Load AdapterConfig from the same --config mapping as ExchangeConfig.
+
+    File/YAML adapter settings apply first; ``FLOP_WX_*`` env vars still win
+    when set. Omitting ``config_path`` is env-only (stubs remain the default).
+    """
+    if config_path is None:
+        return adapter_config_from_env()
+    raw = load_mapping(config_path)
+    return overlay_adapter_env(adapter_config_from_mapping(raw.get("adapters")))
 
 
 def overlay_adapter_env(base: AdapterConfig) -> AdapterConfig:
@@ -293,6 +326,7 @@ def overlay_adapter_env(base: AdapterConfig) -> AdapterConfig:
         "router_repo": "FLOP_WX_ROUTER_REPO",
         "router_script": "FLOP_WX_ROUTER_SCRIPT",
         "router_db": "FLOP_WX_ROUTER_DB",
+        "router_fixture": "FLOP_WX_ROUTER_FIXTURE",
         "sentinel_path": "FLOP_WX_SENTINEL_PATH",
     }
     for field_name, env_name in path_envs.items():
@@ -311,6 +345,11 @@ def overlay_adapter_env(base: AdapterConfig) -> AdapterConfig:
             updates["timeout_seconds"] = float(os.environ["FLOP_WX_ADAPTER_TIMEOUT"])
         except ValueError as exc:
             raise ValidationError("FLOP_WX_ADAPTER_TIMEOUT must be a number") from exc
+    if os.environ.get("FLOP_WX_SCOUT_CANDIDATE_LIMIT"):
+        updates["scout_candidate_limit"] = _candidate_limit(
+            os.environ["FLOP_WX_SCOUT_CANDIDATE_LIMIT"],
+            "FLOP_WX_SCOUT_CANDIDATE_LIMIT",
+        )
     return replace(base, **updates) if updates else base
 
 

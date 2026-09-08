@@ -29,10 +29,19 @@ SCOUT_EVIDENCE_FEED_CLI = (
     "python flop_scout.py evidence feed --since-id 0 --format jsonl"
 )
 ROUTER_DECISION_CLI = (
-    "python router.py decision create <task> --output <file> "
+    "python router.py [--db <projection.sqlite>] decision create <task> "
+    "--output <file> [--fixture fixtures/evidence_consistency.jsonl] "
     "--job-id <id> --job-proto flop-work-exchange.job.v0.1 "
     "--verification-mode OBJECTIVE_BENCH --asset FLOP --max-amount <micro>"
 )
+ROUTER_FIXTURE_RELATIVE = Path("fixtures") / "evidence_consistency.jsonl"
+# Router V1 cannot consume the raw Scout warehouse (~52GiB). Live Router needs a
+# Scout→Router projection ≤1GiB (V2), or the synthetic JSONL fixture.
+ROUTER_V1_MAX_DB_BYTES = 1024 * 1024 * 1024
+DEFAULT_SCOUT_CANDIDATE_LIMIT = 25
+MAX_SCOUT_CANDIDATE_LIMIT = 1000
+MAX_EVIDENCE_IDS_PER_CANDIDATE = 8
+MAX_CLI_JSON_CHARS = 64_000
 
 KNOWN_FAMILY_AGENTS: tuple[dict[str, str], ...] = (
     {"name": "FLOP Scout", "did": SCOUT_DID},

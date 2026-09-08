@@ -8,8 +8,10 @@ from typing import Any
 
 from flop_work_exchange.adapters.process import CommandResult, run_argv
 from flop_work_exchange.constants import (
+    DEFAULT_SCOUT_CANDIDATE_LIMIT,
     EXCHANGE_OPERATOR_GROUP,
     KNOWN_FAMILY_DIDS,
+    MAX_EVIDENCE_IDS_PER_CANDIDATE,
     SCOUT_EVIDENCE_FEED_CLI,
 )
 from flop_work_exchange.exceptions import AdapterError
@@ -24,30 +26,83 @@ def candidates_from_records(
     *,
     source: str,
     notes: str,
+    limit: int = DEFAULT_SCOUT_CANDIDATE_LIMIT,
 ) -> list[WorkerCandidate]:
     """Map Scout-shaped evidence records to worker candidates.
 
     Record text is hostile/untrusted and is never copied into notes.
+    Ranked by evidence count (desc), then DID. Output is capped.
     """
-    candidates: list[WorkerCandidate] = []
-    seen: set[str] = set()
+    grouped: dict[str, list[str]] = {}
     for line_no, record in enumerate(records, start=1):
         did = record.get("did") or record.get("sender_did")
-        if not isinstance(did, str) or not is_valid_ed25519_did(did) or did in seen:
+        if not isinstance(did, str) or not is_valid_ed25519_did(did):
             continue
-        seen.add(did)
         evidence_id = str(record.get("evidence_id") or record.get("id") or f"line-{line_no}")
+        ids = grouped.setdefault(did, [])
+        if evidence_id not in ids:
+            ids.append(evidence_id)
+    ranked = sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
+    cap = max(1, limit)
+    candidates: list[WorkerCandidate] = []
+    for did, evidence_ids in ranked[:cap]:
         operator_group = EXCHANGE_OPERATOR_GROUP if did in KNOWN_FAMILY_DIDS else None
         candidates.append(
             WorkerCandidate(
                 did=did,
-                evidence_ids=[evidence_id],
+                evidence_ids=evidence_ids[:MAX_EVIDENCE_IDS_PER_CANDIDATE],
                 notes=notes,
                 operator_group=operator_group,
                 source=source,
             )
         )
     return candidates
+
+
+def cap_worker_candidates(
+    candidates: Iterable[WorkerCandidate],
+    limit: int = DEFAULT_SCOUT_CANDIDATE_LIMIT,
+) -> list[WorkerCandidate]:
+    """Keep top-N candidates by evidence count. Never dump a warehouse."""
+    ranked = sorted(candidates, key=lambda item: (-len(item.evidence_ids), item.did))
+    cap = max(1, limit)
+    out: list[WorkerCandidate] = []
+    for item in ranked[:cap]:
+        out.append(
+            WorkerCandidate(
+                did=item.did,
+                evidence_ids=list(item.evidence_ids)[:MAX_EVIDENCE_IDS_PER_CANDIDATE],
+                notes=item.notes,
+                operator_group=item.operator_group,
+                source=item.source,
+            )
+        )
+    return out
+
+
+def candidates_payload(
+    candidates: list[WorkerCandidate],
+    *,
+    limit: int,
+    total: int | None = None,
+) -> dict[str, Any]:
+    shown = list(candidates)
+    counted = total if total is not None else len(shown)
+    return {
+        "limit": limit,
+        "shown": len(shown),
+        "truncated": counted > len(shown),
+        "candidates": [
+            {
+                "did": item.did,
+                "evidence_ids": list(item.evidence_ids)[:MAX_EVIDENCE_IDS_PER_CANDIDATE],
+                "notes": item.notes,
+                "operator_group": item.operator_group,
+                "source": item.source,
+            }
+            for item in shown
+        ],
+    }
 
 
 class StubScoutAdapter:
@@ -64,16 +119,22 @@ class StubScoutAdapter:
     kind = "stub"
 
     def __init__(
-        self, evidence_path: Path | None = None, extra_dids: list[str] | None = None
+        self,
+        evidence_path: Path | None = None,
+        extra_dids: list[str] | None = None,
+        *,
+        candidate_limit: int = DEFAULT_SCOUT_CANDIDATE_LIMIT,
     ) -> None:
         self.evidence_path = evidence_path
         self.extra_dids = extra_dids or []
+        self.candidate_limit = candidate_limit
 
     def probe(self) -> dict[str, Any]:
         return {
             "ok": True,
             "kind": self.kind,
             "note": "offline default; not a live Scout backend",
+            "candidate_limit": self.candidate_limit,
         }
 
     def find_candidates(self, job: Job) -> list[WorkerCandidate]:
@@ -89,12 +150,15 @@ class StubScoutAdapter:
         if self.evidence_path and self.evidence_path.exists():
             records = _read_jsonl_records(self.evidence_path)
             for candidate in candidates_from_records(
-                records, source="evidence-jsonl", notes="local evidence feed stub"
+                records,
+                source="evidence-jsonl",
+                notes="local evidence feed stub",
+                limit=self.candidate_limit,
             ):
                 if candidate.did not in seen:
                     seen.add(candidate.did)
                     candidates.append(candidate)
-        return candidates
+        return cap_worker_candidates(candidates, self.candidate_limit)
 
 
 class LocalScoutAdapter:
@@ -122,6 +186,7 @@ class LocalScoutAdapter:
         evidence_jsonl: Path | None = None,
         timeout_seconds: float = 30.0,
         run_command: CommandRunner | None = None,
+        candidate_limit: int = DEFAULT_SCOUT_CANDIDATE_LIMIT,
     ) -> None:
         self.script = script.expanduser() if script is not None else None
         self.python = python
@@ -130,6 +195,7 @@ class LocalScoutAdapter:
         self.evidence_jsonl = evidence_jsonl.expanduser() if evidence_jsonl is not None else None
         self.timeout_seconds = timeout_seconds
         self._run_command = run_command or run_argv
+        self.candidate_limit = candidate_limit
 
     def probe(self) -> dict[str, Any]:
         sources = self._available_sources()
@@ -141,6 +207,7 @@ class LocalScoutAdapter:
             "script": str(self.script) if self.script else None,
             "db_path": str(self._resolved_db_path()) if self._resolved_db_path() else None,
             "evidence_jsonl": str(self.evidence_jsonl) if self.evidence_jsonl else None,
+            "candidate_limit": self.candidate_limit,
             "sources": sources,
             "error": None if ok else "Scout local backend missing (script, observer DB, or JSONL)",
         }
@@ -152,6 +219,7 @@ class LocalScoutAdapter:
             records,
             source=source,
             notes="local scout evidence; message text omitted (untrusted)",
+            limit=self.candidate_limit,
         )
 
     def _available_sources(self) -> list[str]:
@@ -227,21 +295,47 @@ class LocalScoutAdapter:
         conn.row_factory = sqlite3.Row
         try:
             try:
-                rows = conn.execute(
+                ranked = conn.execute(
                     """
-                    SELECT evidence_id, did
+                    SELECT did, COUNT(*) AS evidence_count
                     FROM evidence_records
                     WHERE did IS NOT NULL AND did != ''
-                    ORDER BY retrieved_at, evidence_id
-                    """
+                    GROUP BY did
+                    ORDER BY evidence_count DESC, did ASC
+                    LIMIT ?
+                    """,
+                    (self.candidate_limit,),
                 ).fetchall()
             except sqlite3.Error as exc:
                 raise AdapterError(
                     f"Scout observer DB has no readable evidence_records table: {db_path}"
                 ) from exc
+            records: list[dict[str, Any]] = []
+            for row in ranked:
+                did = row["did"]
+                try:
+                    evid_rows = conn.execute(
+                        """
+                        SELECT evidence_id
+                        FROM evidence_records
+                        WHERE did = ?
+                        ORDER BY retrieved_at DESC, evidence_id DESC
+                        LIMIT ?
+                        """,
+                        (did, MAX_EVIDENCE_IDS_PER_CANDIDATE),
+                    ).fetchall()
+                except sqlite3.Error:
+                    evid_rows = []
+                if evid_rows:
+                    for evid in evid_rows:
+                        records.append({"did": did, "evidence_id": evid["evidence_id"]})
+                else:
+                    records.append(
+                        {"did": did, "evidence_id": f"count-{row['evidence_count']}"}
+                    )
         finally:
             conn.close()
-        return [{"evidence_id": row["evidence_id"], "did": row["did"]} for row in rows]
+        return records
 
 
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:

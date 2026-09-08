@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from flop_work_exchange import __version__
-from flop_work_exchange.config import adapter_config_from_env, load_config
-from flop_work_exchange.constants import DEFAULT_PRODUCTION_STATE
+from flop_work_exchange.adapters.scout import candidates_payload
+from flop_work_exchange.config import AdapterConfig, load_adapter_config, load_config
+from flop_work_exchange.constants import DEFAULT_PRODUCTION_STATE, MAX_CLI_JSON_CHARS
 from flop_work_exchange.demo import run_demo
 from flop_work_exchange.exceptions import WorkExchangeError
 from flop_work_exchange.exchange import WorkExchange
@@ -23,8 +24,16 @@ from flop_work_exchange.ops import doctor, run_live_demo
 from flop_work_exchange.receipts import verify_receipt
 
 
-def _print_json(value: Any) -> None:
-    print(json.dumps(value, indent=2, sort_keys=True, default=str))
+def _print_json(value: Any, *, max_chars: int | None = None) -> None:
+    text = json.dumps(value, indent=2, sort_keys=True, default=str)
+    if max_chars is not None and len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n... [truncated]"
+    print(text)
+
+
+def _adapter_config_from_args(args: argparse.Namespace) -> AdapterConfig:
+    config_path = Path(args.config) if getattr(args, "config", None) else None
+    return load_adapter_config(config_path)
 
 
 def _require_state_dir(args: argparse.Namespace) -> Path:
@@ -111,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     candidates = sub.add_parser("find-candidates", help="Scout-adapter candidate lookup")
     candidates.add_argument("--job-id", required=True)
+    candidates.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max candidates to print (default: adapters.scout_candidate_limit, 25)",
+    )
 
     route = sub.add_parser("route", help="Router-adapter WORK_ROUTE / plans")
     route.add_argument("--job-id", required=True)
@@ -171,15 +186,22 @@ def _dispatch(args: argparse.Namespace) -> int:
         state_dir = args.demo_state_dir or args.state_dir
         if state_dir is None:
             state_dir = Path(tempfile.mkdtemp(prefix="flop-work-exchange-live-demo-"))
-        result = run_live_demo(Path(state_dir), adapter_config=adapter_config_from_env())
-        _print_json(result)
-        return 0 if result.get("verification", {}).get("ok") else 2
+        result = run_live_demo(
+            Path(state_dir),
+            adapter_config=_adapter_config_from_args(args),
+            config_path=Path(args.config) if getattr(args, "config", None) else None,
+        )
+        _print_json(result, max_chars=MAX_CLI_JSON_CHARS)
+        ok = bool(result.get("ok")) and bool(result.get("verification", {}).get("ok"))
+        return 0 if ok else 2
 
     if args.cmd == "doctor":
         state_dir = args.doctor_state_dir or args.state_dir
+        config_path = Path(args.config) if getattr(args, "config", None) else None
         report = doctor(
             state_dir=Path(state_dir) if state_dir is not None else None,
-            adapter_config=adapter_config_from_env(),
+            adapter_config=_adapter_config_from_args(args),
+            config_path=config_path,
         )
         _print_json(report)
         return 0 if report.get("ok") else 1
@@ -265,7 +287,9 @@ def _dispatch(args: argparse.Namespace) -> int:
         _print_json(exchange.balances())
         return 0
     if args.cmd == "find-candidates":
-        _print_json([candidate.__dict__ for candidate in exchange.find_candidates(args.job_id)])
+        found = exchange.find_candidates(args.job_id, limit=args.limit)
+        limit = args.limit or exchange.config.adapters.scout_candidate_limit
+        _print_json(candidates_payload(found, limit=limit), max_chars=MAX_CLI_JSON_CHARS)
         return 0
     if args.cmd == "route":
         _print_json(exchange.route_job(args.job_id).to_dict())

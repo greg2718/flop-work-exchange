@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from flop_work_exchange.config import ExchangeConfig, PolicyConfig
+from flop_work_exchange.constants import DEFAULT_SCOUT_CANDIDATE_LIMIT
 from flop_work_exchange.exchange import WorkExchange
 from flop_work_exchange.identity import create_ephemeral_party, ensure_test_identity
 from flop_work_exchange.receipts import verify_receipt
@@ -61,7 +62,11 @@ def run_demo(state_dir: Path) -> dict[str, Any]:
         "tclk_deal_id": deal.tclk_deal_id,
         "operator_relationship": deal.operator_relationship,
         "independent_reputation_eligible": deal.independent_reputation_eligible,
-        "candidates_from_scout": [candidate.did for candidate in candidates],
+        "candidates_from_scout": [
+            candidate.did for candidate in candidates[:DEFAULT_SCOUT_CANDIDATE_LIMIT]
+        ],
+        "candidates_shown": min(len(candidates), DEFAULT_SCOUT_CANDIDATE_LIMIT),
+        "candidates_limit": DEFAULT_SCOUT_CANDIDATE_LIMIT,
         "router_qualification": plan.qualification,
         "receipt_path": str(receipt_path),
         "receipt": payload,
