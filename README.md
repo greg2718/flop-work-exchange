@@ -229,14 +229,18 @@ checkout (`pip install -e ~/dev/flop_sentinel`) or set `FLOP_WX_SENTINEL_PATH`
 a public clone target). Real contract:
 
 - Detectors: `flop_sentinel.detectors.ALL_DETECTORS` is a tuple of **already
-  instantiated** Detector objects (not classes). Each exposes
-  `detect(message: Message, nt: NormalizedText, now: float) -> list[Finding]`,
+  instantiated** Detector objects with `DETECTOR_ID` and `VERSION`. Prefer
+  `flop_sentinel.detectors.base.run_all(ALL_DETECTORS, message, nt, now)` which
+  returns `(findings, detector_error)`. Otherwise call
+  `detect(message: Message, nt: NormalizedText, now: float)` on each detector —
   **not** `detect(text: str)`.
-- Build `Message` and `NormalizedText` with `flop_sentinel.models` /
-  `flop_sentinel.normalize` helpers. Do not invent a parallel normalizer and
-  do not pass raw strings/blobs into `detect`.
+- CLI construction: `Message(raw=payload_bytes, claimed_did=..., signature=None,
+  sender_id=..., room=..., nonce=...)` then
+  `nt = normalize(message.raw.decode("utf-8"))`. Reuse
+  `flop_sentinel.normalize.normalize`; do not invent a parallel normalizer.
 - Policy: `flop_sentinel.policy.decide(findings, provenance, affiliation, *,
-  detector_error, oversized, detector_versions, artifact_sha256)`.
+  detector_error, oversized, detector_versions, artifact_sha256)` with
+  `detector_versions={d.DETECTOR_ID: d.VERSION for d in ALL_DETECTORS}`.
 - `provenance` / `affiliation` are `flop_sentinel.models` enums, not dicts.
   Paper/local artifacts map to `Provenance.UNSIGNED` (unsigned paper jobs, not
   a made-up `LOCAL` token). Affiliation uses a real `Affiliation` member

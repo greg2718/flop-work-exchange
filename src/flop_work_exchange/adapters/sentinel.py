@@ -90,30 +90,10 @@ _MISSING_DECIDE = (
 )
 _MISSING_DETECT_INPUT = (
     "flop_sentinel detectors require detect(message: Message, nt: NormalizedText, now: float). "
-    "Build Message/NormalizedText via flop_sentinel.models / flop_sentinel.normalize; "
+    "CLI path: Message(raw=bytes, …), nt=normalize(message.raw.decode()), then "
+    "run_all(ALL_DETECTORS, message, nt, now) or detect(message, nt, now). "
     "detect(text: str) is not the library API."
 )
-_TEXT_FIELD_NAMES = frozenset(
-    {
-        "text",
-        "body",
-        "content",
-        "raw",
-        "raw_text",
-        "original",
-        "payload",
-        "message",
-        "source_text",
-        "artifact_text",
-        "normalized",
-    }
-)
-_SENDER_FIELD_NAMES = frozenset(
-    {"sender", "author", "from_", "from_did", "sender_did", "did", "actor"}
-)
-_ROOM_FIELD_NAMES = frozenset({"room", "channel", "artifact_type", "kind", "source"})
-_TIME_FIELD_NAMES = frozenset({"now", "ts", "timestamp", "created_at", "time", "received_at"})
-_ID_FIELD_NAMES = frozenset({"id", "message_id", "msg_id", "artifact_id"})
 
 Importer = Callable[[], Any]
 
@@ -191,21 +171,29 @@ class StubSentinelAdapter:
 class LocalSentinelAdapter:
     """Import flop_sentinel and map ``policy.decide`` onto SentinelVerdict.
 
-    Real unpublished library contract (``greg2718/flop-sentinel``):
+    Real unpublished library contract (Mac CLI path):
 
-        detectors = flop_sentinel.detectors.ALL_DETECTORS  # Detector *instances*
-        message, nt = build via models.Message + normalize helpers
-        findings = detector.detect(message, nt, now)  # not detect(text)
-        verdict = flop_sentinel.policy.decide(
-            findings,
-            provenance,   # flop_sentinel.models.Provenance (paper → UNSIGNED)
-            affiliation,  # flop_sentinel.models.Affiliation (SELF_OPERATED / UNKNOWN)
-            *,
-            detector_error,
-            oversized,
-            detector_versions,
-            artifact_sha256,
+        from flop_sentinel.detectors import ALL_DETECTORS
+        from flop_sentinel.detectors.base import run_all
+        from flop_sentinel.models import Message, Provenance, Affiliation
+        from flop_sentinel.normalize import normalize
+        from flop_sentinel.policy import decide
+
+        message = Message(
+            raw=payload_bytes, claimed_did=..., signature=None, sender_id=...,
+            room=..., nonce=...,
         )
+        nt = normalize(message.raw.decode("utf-8"))
+        findings, detector_error = run_all(ALL_DETECTORS, message, nt, now)
+        verdict = decide(
+            findings, Provenance.UNSIGNED, Affiliation.UNKNOWN,  # or SELF_OPERATED
+            detector_error=detector_error, oversized=...,
+            detector_versions={d.DETECTOR_ID: d.VERSION for d in ALL_DETECTORS},
+            artifact_sha256=...,
+        )
+
+    ``ALL_DETECTORS`` are already-instantiated objects. Prefer ``run_all``;
+    otherwise call ``detect(message, nt, now)`` — never ``detect(text)``.
 
     ``policy`` / ``detectors`` / ``models`` are submodules. They are loaded with
     ``importlib.import_module`` — ``getattr(flop_sentinel, "policy")`` is not
@@ -242,8 +230,9 @@ class LocalSentinelAdapter:
             "kind": self.kind,
             "module": getattr(module, "__name__", "flop_sentinel"),
             "api": (
-                "flop_sentinel.policy.decide(findings, Provenance, Affiliation, *; "
-                "detectors.ALL_DETECTORS.detect(Message, NormalizedText, now))"
+                "flop_sentinel.detectors.base.run_all(ALL_DETECTORS, Message, "
+                "NormalizedText, now) → policy.decide(findings, Provenance.UNSIGNED, "
+                "Affiliation, *; detector_error, oversized, detector_versions, sha256)"
             ),
             "note": "typed policy.decide; findings are rule ids only; no network",
         }
@@ -306,29 +295,30 @@ class LocalSentinelAdapter:
 def collect_sentinel_findings(
     module: Any, artifact_type: str, artifact: dict[str, Any]
 ) -> tuple[list[Any], bool, dict[str, str]]:
-    """Run ALL_DETECTORS. Returns (findings, detector_error, versions).
-
-    Real detectors are instances exposing
-    ``detect(message: Message, nt: NormalizedText, now: float)``. Findings
-    passed back to Work Exchange are reduced to rule ids later.
-    """
-    collection = _require_all_detectors(module)
+    """Run ALL_DETECTORS via the CLI pipeline. Returns (findings, detector_error, versions)."""
+    collection = tuple(
+        _instantiate_detector(item)[0] for item in _require_all_detectors(module)
+    )
     message, nt, now = _prepare_detector_input(module, artifact_type, artifact)
-    findings: list[Any] = []
-    detector_error = False
-    versions: dict[str, str] = {}
-    for item in collection:
-        detector, name, version = _instantiate_detector(item)
-        versions[name] = version
+    versions = {
+        _detector_id(detector): _detector_version(detector) for detector in collection
+    }
+    run_all = _resolve_run_all(module)
+    if run_all is not None:
         try:
-            produced = _run_detector(detector, message=message, nt=nt, now=now)
-        except AdapterError:
-            detector_error = True
-            continue
+            produced = run_all(collection, message, nt, now)
+        except TypeError:
+            pass
         except Exception:
-            detector_error = True
-            continue
-        findings.extend(item for item in _as_list(produced) if _finding_is_positive(item))
+            return [], True, versions
+        else:
+            findings, detector_error = _unpack_run_all(produced)
+            return (
+                [item for item in findings if _finding_is_positive(item)],
+                detector_error,
+                versions,
+            )
+    findings, detector_error = _run_each_detector(collection, message, nt, now)
     return findings, detector_error, versions
 
 
@@ -424,35 +414,31 @@ def _require_all_detectors(module: Any) -> tuple[Any, ...]:
 
 
 def _require_detector_contract(module: Any) -> None:
-    """Message + NormalizedText must be resolvable; detect(text) is not the API."""
+    """CLI types: Message + normalize(); detect(text) is not the API."""
     _resolve_message_cls(module)
-    _resolve_normalized_text_cls(module)
+    _require_normalize(module)
 
 
 def _resolve_message_cls(module: Any) -> Any:
     models = _submodule(module, "models")
-    normalize_mod = _submodule(module, "normalize")
-    for src in (models, normalize_mod):
-        cls = getattr(src, "Message", None) if src is not None else None
-        if cls is not None:
-            return cls
+    cls = getattr(models, "Message", None) if models is not None else None
+    if cls is not None:
+        return cls
     raise AdapterError(
-        "flop_sentinel.models.Message is missing. Detectors take "
-        "detect(message: Message, nt: NormalizedText, now: float), not detect(text)."
+        "flop_sentinel.models.Message is missing. CLI constructs "
+        "Message(raw=bytes, claimed_did, signature, sender_id, room, nonce)."
     )
 
 
-def _resolve_normalized_text_cls(module: Any) -> Any:
-    models = _submodule(module, "models")
+def _require_normalize(module: Any) -> Any:
     normalize_mod = _submodule(module, "normalize")
-    for src in (normalize_mod, models):
-        cls = getattr(src, "NormalizedText", None) if src is not None else None
-        if cls is not None:
-            return cls
-    raise AdapterError(
-        "flop_sentinel.normalize.NormalizedText is missing. Reuse the library "
-        "normalizer; do not call detect(text) or invent a parallel normalizer."
-    )
+    fn = getattr(normalize_mod, "normalize", None) if normalize_mod is not None else None
+    if not callable(fn) or inspect.isclass(fn):
+        raise AdapterError(
+            "flop_sentinel.normalize.normalize is missing. CLI path is "
+            "nt = normalize(message.raw.decode(...)); do not invent a parallel normalizer."
+        )
+    return fn
 
 
 def _require_models(module: Any) -> Any:
@@ -657,14 +643,74 @@ def _instantiate_detector(item: Any) -> tuple[Any, str, str]:
             detector = item
     else:
         detector = item
-    name = (
-        getattr(detector, "name", None)
-        or getattr(item, "name", None)
-        or getattr(item, "__name__", None)
+    return detector, _detector_id(detector), _detector_version(detector)
+
+
+def _detector_id(detector: Any) -> str:
+    value = (
+        getattr(detector, "DETECTOR_ID", None)
+        or getattr(detector, "name", None)
+        or getattr(type(detector), "__name__", None)
         or "detector"
     )
-    version = getattr(detector, "version", None) or getattr(item, "version", None) or "unknown"
-    return detector, str(name), str(version)
+    return str(value)
+
+
+def _detector_version(detector: Any) -> str:
+    value = getattr(detector, "VERSION", None) or getattr(detector, "version", None) or "unknown"
+    return str(value)
+
+
+def _resolve_run_all(module: Any) -> Any | None:
+    detectors = _submodule(module, "detectors")
+    attached_base = getattr(detectors, "base", None) if detectors is not None else None
+    for src in (attached_base, detectors):
+        if src is not None and not inspect.ismodule(src):
+            fn = getattr(src, "run_all", None)
+            if callable(fn):
+                return fn
+    pkg = getattr(module, "__name__", None)
+    if isinstance(pkg, str) and pkg:
+        try:
+            base = importlib.import_module(f"{pkg}.detectors.base")
+        except ImportError:
+            base = None
+        if base is not None:
+            fn = getattr(base, "run_all", None)
+            if callable(fn):
+                return fn
+    if attached_base is not None:
+        fn = getattr(attached_base, "run_all", None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _unpack_run_all(produced: Any) -> tuple[list[Any], bool]:
+    if isinstance(produced, tuple) and len(produced) == 2:
+        findings, detector_error = produced
+        return _as_list(findings), bool(detector_error)
+    raise AdapterError(
+        "flop_sentinel.detectors.base.run_all must return (findings, detector_error)"
+    )
+
+
+def _run_each_detector(
+    collection: tuple[Any, ...], message: Any, nt: Any, now: float
+) -> tuple[list[Any], bool]:
+    findings: list[Any] = []
+    detector_error = False
+    for detector in collection:
+        try:
+            produced = _run_detector(detector, message=message, nt=nt, now=now)
+        except AdapterError:
+            detector_error = True
+            continue
+        except Exception:
+            detector_error = True
+            continue
+        findings.extend(item for item in _as_list(produced) if _finding_is_positive(item))
+    return findings, detector_error
 
 
 def _run_detector(
@@ -677,303 +723,60 @@ def _run_detector(
     fn = getattr(detector, "detect", None)
     if not callable(fn):
         raise AdapterError("detector has no detect(message, nt, now) method")
-    last_exc: TypeError | None = None
-    for args, kwargs in (
-        ((message, nt, now), {}),
-        ((message, nt), {"now": now}),
-        ((), {"message": message, "nt": nt, "now": now}),
-    ):
-        try:
-            return fn(*args, **kwargs)
-        except TypeError as exc:
-            last_exc = exc
-            continue
-    raise AdapterError(_MISSING_DETECT_INPUT) from last_exc
+    try:
+        return fn(message, nt, now)
+    except TypeError as exc:
+        raise AdapterError(_MISSING_DETECT_INPUT) from exc
 
 
 def _prepare_detector_input(
     module: Any, artifact_type: str, artifact: dict[str, Any]
 ) -> tuple[Any, Any, float]:
-    now = time.time()
-    text = _artifact_text(artifact_type, artifact)
-    models = _require_models(module)
-    normalize_mod = _submodule(module, "normalize")
-    message = _build_message(models, normalize_mod, text, artifact, artifact_type, now)
-    nt = _build_normalized_text(models, normalize_mod, text, message)
-    return message, nt, now
-
-
-def _build_message(
-    models: Any,
-    normalize_mod: Any,
-    text: str,
-    artifact: dict[str, Any],
-    artifact_type: str,
-    now: float,
-) -> Any:
-    sender = _sender_from_artifact(artifact)
-    if normalize_mod is not None:
-        for name in (
-            "make_message",
-            "message_from_text",
-            "to_message",
-            "build_message",
-            "message",
-            "from_text",
-        ):
-            fn = getattr(normalize_mod, name, None)
-            if not callable(fn) or inspect.isclass(fn):
-                continue
-            built = _invoke_helper(
-                fn,
-                text=text,
-                message=None,
-                sender=sender,
-                extra_attempts=(
-                    ((text,), {"sender": sender}),
-                    ((text, sender), {}),
-                    ((text,), {}),
-                    ((text,), {"artifact_type": artifact_type}),
-                ),
-            )
-            if built is not None:
-                return built
-    cls = getattr(models, "Message", None) or getattr(normalize_mod, "Message", None)
-    if cls is None:
-        raise AdapterError(
-            "flop_sentinel.models.Message is missing. Detectors take "
-            "detect(message: Message, nt: NormalizedText, now: float), not detect(text)."
-        )
-    return _construct_model(
-        cls,
-        text=text,
-        artifact=artifact,
-        artifact_type=artifact_type,
-        now=now,
-        sender=sender,
-    )
-
-
-def _build_normalized_text(
-    models: Any,
-    normalize_mod: Any,
-    text: str,
-    message: Any,
-) -> Any:
-    if normalize_mod is not None:
-        for name in (
-            "normalize",
-            "normalize_text",
-            "normalize_message",
-            "to_normalized_text",
-            "make_normalized_text",
-            "build_normalized_text",
-        ):
-            fn = getattr(normalize_mod, name, None)
-            if not callable(fn) or inspect.isclass(fn):
-                continue
-            built = _invoke_helper(
-                fn,
-                text=text,
-                message=message,
-                sender=None,
-                extra_attempts=(
-                    ((text,), {}),
-                    ((message,), {}),
-                    ((message, text), {}),
-                    ((), {"text": text}),
-                    ((), {"message": message}),
-                ),
-            )
-            if built is None:
-                continue
-            nt = _coerce_normalized_text(built)
-            if nt is not None:
-                return nt
-    cls = getattr(normalize_mod, "NormalizedText", None) or getattr(
-        models, "NormalizedText", None
-    )
-    if cls is None:
-        raise AdapterError(
-            "flop_sentinel.normalize.NormalizedText is missing. Reuse the library "
-            "normalizer; do not call detect(text) or invent a parallel normalizer."
-        )
-    return _construct_model(
-        cls,
-        text=text,
-        artifact={},
-        artifact_type="",
-        now=0.0,
-        sender=None,
-    )
-
-
-def _coerce_normalized_text(value: Any) -> Any | None:
-    if value is None:
-        return None
-    if isinstance(value, tuple) and len(value) == 2:
-        left, right = value
-        if _looks_like_normalized_text(right):
-            return right
-        if _looks_like_normalized_text(left):
-            return left
-        return right
-    if _looks_like_normalized_text(value):
-        return value
-    for attr in ("nt", "normalized_text", "normalized"):
-        inner = getattr(value, attr, None)
-        if _looks_like_normalized_text(inner):
-            return inner
-    return None
-
-
-def _looks_like_normalized_text(value: Any) -> bool:
-    if value is None or isinstance(value, (str, bytes, dict, list, tuple)):
-        return False
-    cls_name = type(value).__name__
-    if cls_name == "NormalizedText":
-        return True
-    return any(
-        getattr(value, attr, None) is not None
-        for attr in ("normalized", "original", "folded")
-    )
-
-
-def _invoke_helper(
-    fn: Any,
-    *,
-    text: str,
-    message: Any,
-    sender: str | None,
-    extra_attempts: tuple[tuple[tuple[Any, ...], dict[str, Any]], ...],
-) -> Any | None:
-    preferred = _helper_preferred_call(fn, text=text, message=message, sender=sender)
-    attempts = ((preferred,) if preferred is not None else ()) + extra_attempts
-    for args, kwargs in attempts:
-        try:
-            return fn(*args, **kwargs)
-        except (TypeError, AttributeError):
-            continue
-    return None
-
-
-def _helper_preferred_call(
-    fn: Any,
-    *,
-    text: str,
-    message: Any,
-    sender: str | None,
-) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    message = _build_cli_message(module, artifact_type, artifact)
+    raw = getattr(message, "raw", None)
+    if not isinstance(raw, (bytes, bytearray)):
+        raise AdapterError("flop_sentinel.models.Message.raw must be bytes")
     try:
-        signature = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return None
-    params = [
-        param
-        for param in signature.parameters.values()
-        if param.name not in {"self", "cls"}
-        and param.kind
-        not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-    ]
-    if not params:
-        return None
-    first = params[0].name.lower()
-    wants_sender = sender is not None and any(param.name == "sender" for param in params)
-    extra = {"sender": sender} if wants_sender else {}
-    if first in {"message", "msg"} and message is not None:
-        return ((message,), extra)
-    if first in _TEXT_FIELD_NAMES or first in {"raw", "source"}:
-        return ((text,), extra)
-    return None
+        text = bytes(raw).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AdapterError("Message.raw is not utf-8; fail closed") from exc
+    nt = _require_normalize(module)(text)
+    return message, nt, time.time()
 
 
-def _construct_model(
-    cls: Any,
-    *,
-    text: str,
-    artifact: dict[str, Any],
-    artifact_type: str,
-    now: float,
-    sender: str | None,
-) -> Any:
-    for name in ("from_text", "from_raw", "parse"):
-        method = getattr(cls, name, None)
-        if callable(method):
-            built = _invoke_helper(
-                method,
-                text=text,
-                message=None,
-                sender=sender,
-                extra_attempts=(((text,), {}), ((text,), {"sender": sender})),
-            )
-            if built is not None:
-                return built
-    kwargs = _model_kwargs(
-        cls,
-        text=text,
-        artifact=artifact,
-        artifact_type=artifact_type,
-        now=now,
-        sender=sender,
-    )
+def _build_cli_message(module: Any, artifact_type: str, artifact: dict[str, Any]) -> Any:
+    cls = _resolve_message_cls(module)
+    did = _sender_from_artifact(artifact)
+    claimed = artifact.get("claimed_did")
+    if not isinstance(claimed, str) or not claimed.strip():
+        claimed = did
+    sender = artifact.get("sender_id")
+    if not isinstance(sender, str) or not sender.strip():
+        sender_did = artifact.get("sender_did")
+        sender = sender_did if isinstance(sender_did, str) and sender_did.strip() else did
+    nonce = artifact.get("nonce")
+    if not isinstance(nonce, str) or not nonce.strip():
+        job_id = artifact.get("job_id")
+        nonce = job_id if isinstance(job_id, str) else None
+    kwargs = {
+        "raw": canonical_json_bytes(artifact),
+        "claimed_did": claimed,
+        "signature": None,
+        "sender_id": sender,
+        "room": artifact_type,
+        "nonce": nonce,
+    }
     try:
-        if kwargs:
-            return cls(**kwargs)
-        return cls(text)
+        return _call_compatible(cls, (), kwargs)
     except TypeError as exc:
-        try:
-            return cls(text)
-        except TypeError:
-            raise AdapterError(
-                f"cannot construct {getattr(cls, '__name__', cls)!s} for Sentinel detect(); "
-                "fail closed"
-            ) from exc
-
-
-def _model_kwargs(
-    cls: Any,
-    *,
-    text: str,
-    artifact: dict[str, Any],
-    artifact_type: str,
-    now: float,
-    sender: str | None,
-) -> dict[str, Any]:
-    try:
-        signature = inspect.signature(cls)
-    except (TypeError, ValueError):
-        return {"text": text}
-    kwargs: dict[str, Any] = {}
-    missing: list[str] = []
-    for param in signature.parameters.values():
-        if param.name in {"self", "cls"}:
-            continue
-        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-            continue
-        key = param.name.lower()
-        if key in _TEXT_FIELD_NAMES:
-            kwargs[param.name] = text
-        elif key in _SENDER_FIELD_NAMES:
-            if sender is not None or param.default is inspect.Parameter.empty:
-                kwargs[param.name] = sender
-        elif key in _ROOM_FIELD_NAMES:
-            kwargs[param.name] = artifact_type
-        elif key in _TIME_FIELD_NAMES:
-            kwargs[param.name] = now
-        elif key in _ID_FIELD_NAMES:
-            ident = artifact.get("job_id")
-            kwargs[param.name] = ident if isinstance(ident, str) else artifact_type
-        elif param.default is inspect.Parameter.empty:
-            missing.append(param.name)
-    if missing:
         raise AdapterError(
-            f"cannot map {', '.join(missing)} onto {getattr(cls, '__name__', cls)}; fail closed"
-        )
-    return kwargs
+            "cannot construct flop_sentinel.models.Message(raw=bytes, claimed_did, "
+            "signature, sender_id, room, nonce); fail closed"
+        ) from exc
 
 
 def _sender_from_artifact(artifact: dict[str, Any]) -> str | None:
-    for key in ("sender_did", "buyer_did", "seller_did", "claimed_did", "sender"):
+    for key in ("sender_did", "buyer_did", "seller_did", "claimed_did", "sender_id", "sender"):
         value = artifact.get(key)
         if isinstance(value, str) and value.strip():
             return value
@@ -991,15 +794,6 @@ def _finding_is_positive(item: Any) -> bool:
     if not explicit:
         return True
     return any(bool(flag) for flag in explicit)
-
-
-def _artifact_text(artifact_type: str, artifact: dict[str, Any]) -> str:
-    parts = [artifact_type]
-    for key in sorted(artifact):
-        value = artifact[key]
-        if isinstance(value, str):
-            parts.append(value)
-    return "\n".join(parts)
 
 
 def _unpack_verdict(raw: Any) -> tuple[Any, Any, list[Any], list[Any]]:
