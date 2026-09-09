@@ -38,13 +38,17 @@ from flop_work_exchange.adapters.sentinel import (
 )
 from flop_work_exchange.canonical import result_hash_for
 from flop_work_exchange.config import AdapterConfig, load_adapter_config
+from flop_work_exchange.constants import KNOWN_FAMILY_DIDS
 from flop_work_exchange.exceptions import AdapterError
-from flop_work_exchange.identity import create_ephemeral_party
+from flop_work_exchange.identity import create_ephemeral_party, is_valid_ed25519_did
 from flop_work_exchange.models import Job, Offer
 from flop_work_exchange.ops import doctor, run_live_demo
 from tests.helpers import fresh_dids
 
 FAMILY_SCOUT = "did:key:z6MkfJnczowbivU9SEDcZ77MEpKUfQTVbcD3i1gcwsfo4yL1"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE_LIVE_OPS = REPO_ROOT / "examples" / "live-ops.yaml"
+EXAMPLE_SCOUT_JSONL = REPO_ROOT / "examples" / "scout-evidence.jsonl"
 
 
 @pytest.fixture
@@ -1144,6 +1148,9 @@ adapters:
     assert example_cfg.router_fixture is not None
     assert example_cfg.scout_candidate_limit == 25
     assert example_cfg.scout_sqlite_timeout_seconds == 5.0
+    assert example_cfg.scout_evidence_jsonl is not None
+    assert example_cfg.scout_evidence_jsonl.is_file()
+    assert example_cfg.scout_evidence_jsonl.name == "scout-evidence.jsonl"
 
 
 def test_local_scout_caps_candidates_by_evidence_count(tmp_path: Path) -> None:
@@ -1372,6 +1379,105 @@ adapters:
     assert overridden.scout_sqlite_timeout_seconds == 3.5
     assert overridden.scout_max_db_bytes == 2048
     assert overridden.scout_projection_db == tmp_path / "env-proj.sqlite"
+
+
+def test_example_scout_evidence_jsonl_is_valid_paper_fixture() -> None:
+    text = EXAMPLE_SCOUT_JSONL.read_text(encoding="utf-8")
+    records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    assert 2 <= len(records) <= 20
+    dids: list[str] = []
+    for record in records:
+        did = record["did"]
+        assert is_valid_ed25519_did(did)
+        assert did not in KNOWN_FAMILY_DIDS
+        assert record.get("evidence_id")
+        assert record.get("fixture") == "synthetic-paper-ops"
+        dids.append(did)
+    assert len(set(dids)) >= 2
+    assert len(dids) > len(set(dids))
+
+
+def test_example_scout_jsonl_keeps_local_scout_without_opening_warehouse(
+    tmp_path: Path, clean_wx_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warehouse = tmp_path / "observer.sqlite"
+    warehouse.write_bytes(b"x" * 64)
+    opened: list[str] = []
+    real_connect = sqlite3.connect
+
+    def wrapped(
+        database: str | bytes, *args: object, **kwargs: object
+    ) -> sqlite3.Connection:
+        opened.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", wrapped)
+    adapter = LocalScoutAdapter(
+        db_path=warehouse,
+        evidence_jsonl=EXAMPLE_SCOUT_JSONL,
+        max_db_bytes=16,
+    )
+    probe = adapter.probe()
+    assert probe["ok"] is True
+    assert probe["preferred_source"] == "jsonl"
+    found = adapter.find_candidates(_job())
+    assert found
+    assert found[0].source == "local-scout-jsonl"
+    assert all(is_valid_ed25519_did(item.did) for item in found)
+    assert found[0].did not in KNOWN_FAMILY_DIDS
+    assert not any("observer.sqlite" in path for path in opened)
+
+
+def test_live_ops_yaml_factory_reads_example_jsonl(
+    tmp_path: Path, clean_wx_env: None
+) -> None:
+    loaded = load_adapter_config(EXAMPLE_LIVE_OPS)
+    assert loaded.scout_mode == "local"
+    assert loaded.scout_evidence_jsonl is not None
+    assert loaded.scout_evidence_jsonl.is_file()
+    warehouse = tmp_path / "observer.sqlite"
+    warehouse.write_bytes(b"x" * 64)
+    bundle = resolve_adapters(
+        AdapterConfig(
+            scout_mode="local",
+            scout_db=warehouse,
+            scout_evidence_jsonl=loaded.scout_evidence_jsonl,
+            scout_max_db_bytes=16,
+        )
+    )
+    assert isinstance(bundle.scout, LocalScoutAdapter)
+    found = bundle.scout.find_candidates(_job())
+    assert found
+    assert found[0].source == "local-scout-jsonl"
+    result = run_live_demo(
+        tmp_path / "wx",
+        adapter_config=AdapterConfig(
+            scout_mode="local",
+            scout_db=warehouse,
+            scout_evidence_jsonl=loaded.scout_evidence_jsonl,
+            scout_max_db_bytes=16,
+        ),
+    )
+    assert result["adapter_kinds"]["scout"] == "local"
+    assert result["candidates_from_scout"]
+    scout_notes = [note for note in result["adapter_notes"] if note.startswith("scout:")]
+    assert scout_notes
+    assert all("falling back to stub" not in note for note in scout_notes)
+
+
+def test_live_ops_jsonl_resolves_next_to_config_when_cwd_differs(
+    tmp_path: Path, clean_wx_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    loaded = load_adapter_config(EXAMPLE_LIVE_OPS)
+    assert loaded.scout_evidence_jsonl is not None
+    assert loaded.scout_evidence_jsonl.is_file()
+    assert loaded.scout_evidence_jsonl.resolve() == EXAMPLE_SCOUT_JSONL.resolve()
+    report = doctor(adapter_config=loaded, config_path=EXAMPLE_LIVE_OPS)
+    scout = next(check for check in report["checks"] if check["name"] == "adapter_scout")
+    assert scout["ok"] is True
+    assert scout["kind"] == "local"
+    assert scout["probe"]["preferred_source"] == "jsonl"
 
 
 @pytest.mark.live
