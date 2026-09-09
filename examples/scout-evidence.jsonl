@@ -1,0 +1,6 @@
+{"did": "did:key:z6MkmNUviNmZDVfkk3Kuzk6eJuPTwVrk2UHntmszFbVdY7PE", "evidence_id": "paper-ops-alpha-001", "evidence_count": 3, "fixture": "synthetic-paper-ops", "role": "paper-demo-worker"}
+{"did": "did:key:z6MkmNUviNmZDVfkk3Kuzk6eJuPTwVrk2UHntmszFbVdY7PE", "evidence_id": "paper-ops-alpha-002", "evidence_count": 3, "fixture": "synthetic-paper-ops", "role": "paper-demo-worker"}
+{"did": "did:key:z6MkmNUviNmZDVfkk3Kuzk6eJuPTwVrk2UHntmszFbVdY7PE", "evidence_id": "paper-ops-alpha-003", "evidence_count": 3, "fixture": "synthetic-paper-ops", "role": "paper-demo-worker"}
+{"did": "did:key:z6Mks1YxxCDTxuUq4iPesTtHoyxPTkQJ7fR9ZmAuy8oWEp64", "evidence_id": "paper-ops-bravo-001", "evidence_count": 2, "fixture": "synthetic-paper-ops", "role": "paper-demo-worker"}
+{"did": "did:key:z6Mks1YxxCDTxuUq4iPesTtHoyxPTkQJ7fR9ZmAuy8oWEp64", "evidence_id": "paper-ops-bravo-002", "evidence_count": 2, "fixture": "synthetic-paper-ops", "role": "paper-demo-worker"}
+{"did": "did:key:z6MksuiTh81F36rePfwAeyUNUrkwH9fYkbLQasHNYpoqanTZ", "evidence_id": "paper-ops-charlie-001", "evidence_count": 1, "fixture": "synthetic-paper-ops", "role": "paper-demo-worker"}

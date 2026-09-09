@@ -60,10 +60,43 @@ class FeeSchedule:
         )
 
 
-def _optional_path(value: Any) -> Path | None:
+def _optional_path(value: Any, *, relative_to: Path | None = None) -> Path | None:
     if value is None or value == "":
         return None
-    return Path(str(value)).expanduser()
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return path
+    existing = _first_existing_relative(path, relative_to=relative_to)
+    return existing if existing is not None else path
+
+
+def _first_existing_relative(path: Path, *, relative_to: Path | None) -> Path | None:
+    """Resolve a relative config path against cwd, then the config file location.
+
+    ``examples/scout-evidence.jsonl`` works from the repo root. The same YAML
+    also resolves when ``--config`` is an absolute path to ``examples/live-ops.yaml``
+    (file next to the YAML, or repo-relative from the parent of ``examples/``).
+    """
+    candidates: list[Path] = [path]
+    if relative_to is not None:
+        base = relative_to.expanduser()
+        if not base.is_dir():
+            base = base.parent
+        candidates.append(base / path)
+        candidates.append(base / path.name)
+        candidates.append(base.parent / path)
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _adapter_mode(value: Any, label: str) -> AdapterMode:
@@ -249,7 +282,9 @@ def load_mapping(path: Path) -> dict[str, Any]:
     return _require_mapping(loaded, "config")
 
 
-def config_from_mapping(state_dir: Path, raw: dict[str, Any]) -> ExchangeConfig:
+def config_from_mapping(
+    state_dir: Path, raw: dict[str, Any], *, config_path: Path | None = None
+) -> ExchangeConfig:
     payment_mode = raw.get("payment_mode", "paper")
     if payment_mode != "paper":
         raise ValidationError('payment_mode must be "paper"; live rails are not available')
@@ -271,16 +306,20 @@ def config_from_mapping(state_dir: Path, raw: dict[str, Any]) -> ExchangeConfig:
         known_family_dids=known,
         operator_group=str(raw.get("operator_group", EXCHANGE_OPERATOR_GROUP)),
         asset=str(raw.get("asset", "FLOP")),
-        adapters=overlay_adapter_env(adapter_config_from_mapping(raw.get("adapters"))),
+        adapters=overlay_adapter_env(
+            adapter_config_from_mapping(raw.get("adapters"), config_path=config_path)
+        ),
     )
 
 
 def load_config(state_dir: Path, config_path: Path | None = None) -> ExchangeConfig:
     path = config_path or default_fee_config_path()
-    return config_from_mapping(state_dir, load_mapping(path))
+    return config_from_mapping(state_dir, load_mapping(path), config_path=path)
 
 
-def adapter_config_from_mapping(raw: Any | None) -> AdapterConfig:
+def adapter_config_from_mapping(
+    raw: Any | None, *, config_path: Path | None = None
+) -> AdapterConfig:
     if raw is None:
         return AdapterConfig()
     mapping = _require_mapping(raw, "adapters")
@@ -293,30 +332,34 @@ def adapter_config_from_mapping(raw: Any | None) -> AdapterConfig:
         "scout_sqlite_timeout_seconds", DEFAULT_SCOUT_SQLITE_TIMEOUT_SECONDS
     )
     max_db_bytes = mapping.get("scout_max_db_bytes", SCOUT_MAX_QUERY_DB_BYTES)
+
+    def path(value: Any) -> Path | None:
+        return _optional_path(value, relative_to=config_path)
+
     return AdapterConfig(
         scout_mode=_adapter_mode(mapping.get("scout_mode", "stub"), "scout_mode"),
         bench_mode=_adapter_mode(mapping.get("bench_mode", "stub"), "bench_mode"),
         router_mode=_adapter_mode(mapping.get("router_mode", "stub"), "router_mode"),
         sentinel_mode=_adapter_mode(mapping.get("sentinel_mode", "stub"), "sentinel_mode"),
         python=str(mapping.get("python") or sys.executable),
-        scout_repo=_optional_path(mapping.get("scout_repo")),
-        scout_script=_optional_path(mapping.get("scout_script")),
-        scout_state_dir=_optional_path(mapping.get("scout_state_dir")),
-        scout_db=_optional_path(mapping.get("scout_db")),
-        scout_projection_db=_optional_path(mapping.get("scout_projection_db")),
-        scout_evidence_jsonl=_optional_path(mapping.get("scout_evidence_jsonl")),
+        scout_repo=path(mapping.get("scout_repo")),
+        scout_script=path(mapping.get("scout_script")),
+        scout_state_dir=path(mapping.get("scout_state_dir")),
+        scout_db=path(mapping.get("scout_db")),
+        scout_projection_db=path(mapping.get("scout_projection_db")),
+        scout_evidence_jsonl=path(mapping.get("scout_evidence_jsonl")),
         scout_sqlite_timeout_seconds=_positive_float(
             sqlite_timeout, "adapters.scout_sqlite_timeout_seconds"
         ),
         scout_max_db_bytes=_positive_int(max_db_bytes, "adapters.scout_max_db_bytes"),
         bench_cli=str(mapping["bench_cli"]) if mapping.get("bench_cli") else None,
-        bench_repo=_optional_path(mapping.get("bench_repo")),
+        bench_repo=path(mapping.get("bench_repo")),
         bench_allow_local_exec=bool(mapping.get("bench_allow_local_exec", False)),
-        router_repo=_optional_path(mapping.get("router_repo")),
-        router_script=_optional_path(mapping.get("router_script")),
-        router_db=_optional_path(mapping.get("router_db")),
-        router_fixture=_optional_path(mapping.get("router_fixture")),
-        sentinel_path=_optional_path(mapping.get("sentinel_path")),
+        router_repo=path(mapping.get("router_repo")),
+        router_script=path(mapping.get("router_script")),
+        router_db=path(mapping.get("router_db")),
+        router_fixture=path(mapping.get("router_fixture")),
+        sentinel_path=path(mapping.get("sentinel_path")),
         timeout_seconds=timeout,
         scout_candidate_limit=_candidate_limit(
             mapping.get("scout_candidate_limit", DEFAULT_SCOUT_CANDIDATE_LIMIT),
@@ -338,7 +381,9 @@ def load_adapter_config(config_path: Path | None = None) -> AdapterConfig:
     if config_path is None:
         return adapter_config_from_env()
     raw = load_mapping(config_path)
-    return overlay_adapter_env(adapter_config_from_mapping(raw.get("adapters")))
+    return overlay_adapter_env(
+        adapter_config_from_mapping(raw.get("adapters"), config_path=config_path)
+    )
 
 
 def overlay_adapter_env(base: AdapterConfig) -> AdapterConfig:

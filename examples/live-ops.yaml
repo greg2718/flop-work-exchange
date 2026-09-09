@@ -23,16 +23,22 @@ adapters:
   sentinel_mode: local
   scout_repo: ~/dev/flop_scout_v02
   scout_state_dir: ~/.flop_scout
+  # Paper live-ops prefers this curated JSONL so Mac live-demo keeps
+  # adapter_kinds.scout == local. It is a synthetic paper-ops fixture
+  # (valid Ed25519 did:key workers, not family DIDs, not a warehouse dump).
+  # live-demo still creates an ephemeral seller for the actual offer;
+  # these rows are only for find_candidates / ranking signal.
+  # Path is repo-relative (examples/scout-evidence.jsonl). Run Mac verify
+  # from the repo root, or pass --config with a path to this YAML: relative
+  # JSONL paths also resolve next to the config file.
   # Raw ~/.flop_scout/observer.sqlite is a ~48–52GiB warehouse. GROUP BY
   # across evidence_records hangs find_candidates even with LIMIT 25.
-  # Prefer a Scout projection (≤1GiB) or evidence JSONL. The local adapter
-  # refuses oversized warehouses (fail closed) instead of scanning them.
-  # Scout v0.2 projection tooling (scout_projection*.py / scout_projection_cli.py)
-  # lives in flop_scout_v02; Work Exchange does not vendor Scout.
+  # A Scout projection (≤1GiB) is the next step for real Scout-backed feeds;
+  # the warehouse is still refused. Work Exchange does not vendor Scout.
   # If ~/.flop_scout/scout_projection.sqlite or projection.sqlite exists, it
   # is picked up automatically. Otherwise set:
   # scout_projection_db: ~/.flop_scout/scout_projection.sqlite
-  # scout_evidence_jsonl: /path/to/evidence.jsonl
+  scout_evidence_jsonl: examples/scout-evidence.jsonl
   scout_sqlite_timeout_seconds: 5
   scout_candidate_limit: 25
   bench_repo: ~/dev/flop_bench
