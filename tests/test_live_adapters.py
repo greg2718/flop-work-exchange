@@ -23,7 +23,12 @@ from flop_work_exchange.adapters.router import (
     StubRouterAdapter,
     map_router_decision,
 )
-from flop_work_exchange.adapters.scout import LocalScoutAdapter, StubScoutAdapter
+from flop_work_exchange.adapters.scout import (
+    LocalScoutAdapter,
+    StubScoutAdapter,
+    assess_scout_sqlite,
+    run_sqlite_readonly,
+)
 from flop_work_exchange.adapters.sentinel import (
     _PAPER_PROVENANCE_NAMES,
     LocalSentinelAdapter,
@@ -69,6 +74,39 @@ def _offer(job: Job, seller_did: str) -> Offer:
         seller_did=seller_did,
         price_micro=12_000_000,
     )
+
+
+def _write_evidence_db(path: Path, rows: list[tuple[str, str]]) -> Path:
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE evidence_records (
+            evidence_id TEXT PRIMARY KEY,
+            room TEXT NOT NULL,
+            generation TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            retrieved_at TEXT NOT NULL,
+            did TEXT,
+            text TEXT NOT NULL
+        )
+        """
+    )
+    for seq, (did, evidence_id) in enumerate(rows, start=1):
+        conn.execute(
+            "INSERT INTO evidence_records VALUES (?,?,?,?,?,?,?)",
+            (
+                evidence_id,
+                "lobby",
+                "0",
+                seq,
+                "2026-01-01T00:00:00Z",
+                did,
+                "untrusted warehouse text",
+            ),
+        )
+    conn.commit()
+    conn.close()
+    return path
 
 
 def test_stub_scout_still_reads_jsonl(tmp_path: Path) -> None:
@@ -1105,6 +1143,7 @@ adapters:
     assert example_cfg.scout_mode == "local"
     assert example_cfg.router_fixture is not None
     assert example_cfg.scout_candidate_limit == 25
+    assert example_cfg.scout_sqlite_timeout_seconds == 5.0
 
 
 def test_local_scout_caps_candidates_by_evidence_count(tmp_path: Path) -> None:
@@ -1148,6 +1187,191 @@ def test_local_scout_caps_candidates_by_evidence_count(tmp_path: Path) -> None:
     assert found[1].did == dids[-2]
     assert len(found[0].evidence_ids) <= 8
     assert "untrusted warehouse text" not in found[0].notes
+
+
+def test_local_scout_prefers_jsonl_then_projection_over_warehouse(tmp_path: Path) -> None:
+    warehouse_did = create_ephemeral_party("warehouse")[1]
+    projection_did = create_ephemeral_party("projection")[1]
+    jsonl_did = create_ephemeral_party("jsonl")[1]
+    warehouse = _write_evidence_db(tmp_path / "observer.sqlite", [(warehouse_did, "ev-w")])
+    projection = _write_evidence_db(
+        tmp_path / "scout_projection.sqlite", [(projection_did, "ev-p")]
+    )
+    jsonl = tmp_path / "feed.jsonl"
+    jsonl.write_text(
+        json.dumps({"did": jsonl_did, "evidence_id": "ev-j"}) + "\n", encoding="utf-8"
+    )
+
+    jsonl_found = LocalScoutAdapter(
+        db_path=warehouse, projection_db=projection, evidence_jsonl=jsonl
+    ).find_candidates(_job())
+    assert jsonl_found[0].did == jsonl_did
+    assert jsonl_found[0].source == "local-scout-jsonl"
+
+    projection_found = LocalScoutAdapter(
+        db_path=warehouse, projection_db=projection
+    ).find_candidates(_job())
+    assert projection_found[0].did == projection_did
+    assert projection_found[0].source == "local-scout-projection"
+
+    warehouse_found = LocalScoutAdapter(db_path=warehouse).find_candidates(_job())
+    assert warehouse_found[0].did == warehouse_did
+    assert warehouse_found[0].source == "local-scout-sqlite"
+
+
+def test_local_scout_oversized_warehouse_fail_closed(tmp_path: Path) -> None:
+    warehouse = tmp_path / "observer.sqlite"
+    warehouse.write_bytes(b"x" * 64)
+    adapter = LocalScoutAdapter(db_path=warehouse, max_db_bytes=16)
+    probe = adapter.probe()
+    assert probe["ok"] is False
+    assert probe["preferred_source"] is None
+    assert probe["warehouse"]["oversized"] is True
+    assert probe["warehouse"]["risky"] is True
+    assert "sqlite:" not in "".join(probe["sources"])
+    assert "GiB" in (probe["error"] or "")
+    with pytest.raises(AdapterError, match="will not GROUP BY the raw warehouse"):
+        adapter.find_candidates(_job())
+
+    assessed = assess_scout_sqlite(warehouse, max_bytes=16, role="warehouse")
+    assert assessed["ok"] is False
+    assert assessed["oversized"] is True
+
+
+def test_local_scout_oversized_warehouse_still_uses_jsonl(tmp_path: Path) -> None:
+    warehouse = tmp_path / "observer.sqlite"
+    warehouse.write_bytes(b"x" * 64)
+    seller = fresh_dids()[1]
+    jsonl = tmp_path / "feed.jsonl"
+    jsonl.write_text(json.dumps({"did": seller, "evidence_id": "ev-1"}) + "\n", encoding="utf-8")
+    adapter = LocalScoutAdapter(db_path=warehouse, evidence_jsonl=jsonl, max_db_bytes=16)
+    probe = adapter.probe()
+    assert probe["ok"] is True
+    assert probe["preferred_source"] == "jsonl"
+    assert probe["warehouse"]["oversized"] is True
+    found = adapter.find_candidates(_job())
+    assert found[0].did == seller
+    assert found[0].source == "local-scout-jsonl"
+
+
+def test_local_scout_cli_failure_does_not_scan_oversized_warehouse(tmp_path: Path) -> None:
+    script = tmp_path / "flop_scout.py"
+    script.write_text("# fake scout\n", encoding="utf-8")
+    warehouse = tmp_path / "observer.sqlite"
+    warehouse.write_bytes(b"x" * 64)
+
+    def runner(argv: list[str], **_kwargs: object) -> CommandResult:
+        return CommandResult(tuple(argv), 2, "", "no evidence feed")
+
+    adapter = LocalScoutAdapter(
+        script=script,
+        db_path=warehouse,
+        max_db_bytes=16,
+        run_command=runner,
+    )
+    probe = adapter.probe()
+    assert probe["ok"] is True
+    assert probe["preferred_source"] == "cli"
+    assert probe["warehouse"]["oversized"] is True
+    with pytest.raises(AdapterError, match="will not GROUP BY the raw warehouse"):
+        adapter.find_candidates(_job())
+
+
+def test_run_sqlite_readonly_times_out(tmp_path: Path) -> None:
+    db = tmp_path / "slow.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE t (id INTEGER)")
+    conn.commit()
+    conn.close()
+
+    def hang(connection: sqlite3.Connection) -> object:
+        return connection.execute(
+            """
+            WITH RECURSIVE cnt(x) AS (
+                SELECT 1
+                UNION ALL
+                SELECT x + 1 FROM cnt WHERE x < 1000000000
+            )
+            SELECT COUNT(*) FROM cnt
+            """
+        ).fetchone()
+
+    with pytest.raises(AdapterError, match="timed out"):
+        run_sqlite_readonly(db, hang, timeout_seconds=0.2)
+
+
+def test_factory_discovers_projection_and_probe_flags_warehouse(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "scout-state"
+    state.mkdir()
+    (state / "observer.sqlite").write_bytes(b"x" * 80_000)
+    projection_did = create_ephemeral_party("proj")[1]
+    projection = _write_evidence_db(state / "scout_projection.sqlite", [(projection_did, "ev-p")])
+    bundle = resolve_adapters(
+        AdapterConfig(
+            scout_mode="local",
+            scout_state_dir=state,
+            scout_max_db_bytes=40_000,
+        )
+    )
+    assert isinstance(bundle.scout, LocalScoutAdapter)
+    assert bundle.scout.projection_db == projection
+    probe = bundle.scout.probe()
+    assert probe["preferred_source"] == "projection"
+    assert probe["warehouse"]["oversized"] is True
+    found = bundle.scout.find_candidates(_job())
+    assert found[0].did == projection_did
+    assert found[0].source == "local-scout-projection"
+
+
+def test_live_demo_oversized_scout_warehouse_falls_back(tmp_path: Path) -> None:
+    warehouse = tmp_path / "observer.sqlite"
+    warehouse.write_bytes(b"x" * 64)
+    result = run_live_demo(
+        tmp_path / "wx",
+        adapter_config=AdapterConfig(
+            scout_mode="local",
+            scout_db=warehouse,
+            scout_max_db_bytes=16,
+        ),
+    )
+    assert result["ok"] is True
+    assert result["adapter_kinds"]["scout"] == "stub"
+    assert any("falling back to stub" in note for note in result["adapter_notes"])
+    assert result["adapter_errors"] == []
+
+
+def test_yaml_scout_projection_and_timeout_env(
+    tmp_path: Path, clean_wx_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    yaml_path = tmp_path / "ops.yaml"
+    projection = tmp_path / "proj.sqlite"
+    jsonl = tmp_path / "feed.jsonl"
+    yaml_path.write_text(
+        f"""
+payment_mode: paper
+adapters:
+  scout_mode: local
+  scout_projection_db: {projection}
+  scout_evidence_jsonl: {jsonl}
+  scout_sqlite_timeout_seconds: 7
+  scout_max_db_bytes: 4096
+""",
+        encoding="utf-8",
+    )
+    loaded = load_adapter_config(yaml_path)
+    assert loaded.scout_projection_db == projection
+    assert loaded.scout_evidence_jsonl == jsonl
+    assert loaded.scout_sqlite_timeout_seconds == 7.0
+    assert loaded.scout_max_db_bytes == 4096
+    monkeypatch.setenv("FLOP_WX_SCOUT_SQLITE_TIMEOUT", "3.5")
+    monkeypatch.setenv("FLOP_WX_SCOUT_MAX_DB_BYTES", "2048")
+    monkeypatch.setenv("FLOP_WX_SCOUT_PROJECTION_DB", str(tmp_path / "env-proj.sqlite"))
+    overridden = load_adapter_config(yaml_path)
+    assert overridden.scout_sqlite_timeout_seconds == 3.5
+    assert overridden.scout_max_db_bytes == 2048
+    assert overridden.scout_projection_db == tmp_path / "env-proj.sqlite"
 
 
 @pytest.mark.live

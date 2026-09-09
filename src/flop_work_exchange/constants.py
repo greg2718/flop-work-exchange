@@ -38,6 +38,13 @@ ROUTER_FIXTURE_RELATIVE = Path("fixtures") / "evidence_consistency.jsonl"
 # Router V1 cannot consume the raw Scout warehouse (~52GiB). Live Router needs a
 # Scout→Router projection ≤1GiB (V2), or the synthetic JSONL fixture.
 ROUTER_V1_MAX_DB_BYTES = 1024 * 1024 * 1024
+# Work Exchange must not GROUP BY the raw Scout observer warehouse. Prefer a
+# Scout projection (same 1GiB cap as Router) or evidence JSONL. Configurable
+# via adapters.scout_max_db_bytes / FLOP_WX_SCOUT_MAX_DB_BYTES.
+SCOUT_MAX_QUERY_DB_BYTES = ROUTER_V1_MAX_DB_BYTES
+DEFAULT_SCOUT_SQLITE_TIMEOUT_SECONDS = 5.0
+SCOUT_WAREHOUSE_DB_NAME = "observer.sqlite"
+SCOUT_PROJECTION_FILENAMES = ("scout_projection.sqlite", "projection.sqlite")
 DEFAULT_SCOUT_CANDIDATE_LIMIT = 25
 MAX_SCOUT_CANDIDATE_LIMIT = 1000
 MAX_EVIDENCE_IDS_PER_CANDIDATE = 8

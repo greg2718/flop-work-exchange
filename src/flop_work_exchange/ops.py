@@ -123,6 +123,14 @@ def doctor(
         },
         "config_path": str(config_path) if config_path is not None else None,
         "scout_candidate_limit": adapters.scout_candidate_limit,
+        "scout_projection_db": (
+            str(adapters.scout_projection_db) if adapters.scout_projection_db else None
+        ),
+        "scout_evidence_jsonl": (
+            str(adapters.scout_evidence_jsonl) if adapters.scout_evidence_jsonl else None
+        ),
+        "scout_sqlite_timeout_seconds": adapters.scout_sqlite_timeout_seconds,
+        "scout_max_db_bytes": adapters.scout_max_db_bytes,
         "router_db": str(adapters.router_db) if adapters.router_db else None,
         "router_fixture": str(adapters.router_fixture) if adapters.router_fixture else None,
         "checks": checks,

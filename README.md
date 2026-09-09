@@ -102,7 +102,7 @@ missing — stub success is never labeled as live.
 
 | Adapter | Sibling | Stub behavior | Local wiring |
 | --- | --- | --- | --- |
-| Scout | [flop-scout](https://github.com/greg2718/flop-scout) | Reads optional local evidence JSONL; never opens a network socket | Tries `python flop_scout.py evidence feed --since-id 0 --format jsonl`; falls back to read-only `observer.sqlite` `evidence_records`. Caps candidates (default 25, ranked by evidence count) |
+| Scout | [flop-scout](https://github.com/greg2718/flop-scout) | Reads optional local evidence JSONL; never opens a network socket | Prefers `scout_evidence_jsonl`, then a ≤1GiB `scout_projection_db`, then `python flop_scout.py evidence feed --since-id 0 --format jsonl` (timed). Raw `observer.sqlite` is used only when under the size cap, with a sqlite wall-clock timeout; oversized warehouses fail closed. Caps candidates (default 25) |
 | Router | [flop-router](https://github.com/greg2718/flop-router) | Lowest in-budget offer → Router decision document | Subprocess `router.py [--db projection] decision create --output … [--fixture …]`; maps `work_route` / plans; forces `SIMULATION_ONLY` / `DISABLED`. Probe fails closed unless a ≤1GiB db or fixture is usable |
 | Sentinel | local `flop_sentinel` (not published) | Artifact in → `ALLOW` / `REVIEW` / `REJECT`; fail-closed | Import `flop_sentinel` (`pip install -e ".[live]"` plus a local checkout, or `FLOP_WX_SENTINEL_PATH`); build `Message`/`NormalizedText` via library normalize helpers → `ALL_DETECTORS.detect(message, nt, now)` → `policy.decide(findings, provenance, affiliation, …)`; findings are rule ids only |
 | Bench | [flop-bench](https://github.com/greg2718/flop-bench) | Checks `result_hash == sha256(result_text)`; no local exec | Generates a passive spec and runs `flop-bench verify --state-dir <temp>`; `--allow-local-exec` only if explicitly enabled |
@@ -167,6 +167,12 @@ export FLOP_WX_SENTINEL_MODE=local
 export FLOP_WX_SCOUT_REPO=~/dev/flop_scout_v02
 export FLOP_SCOUT_STATE_DIR=~/.flop_scout
 export FLOP_WX_SCOUT_CANDIDATE_LIMIT=25
+# Live Scout: prefer evidence JSONL or a ≤1GiB Scout projection. Do not query
+# the raw ~/.flop_scout/observer.sqlite warehouse (~48–52GiB); GROUP BY hangs.
+# export FLOP_WX_SCOUT_EVIDENCE_JSONL=/path/to/evidence.jsonl
+# export FLOP_WX_SCOUT_PROJECTION_DB=~/.flop_scout/scout_projection.sqlite
+# export FLOP_WX_SCOUT_SQLITE_TIMEOUT=5
+# export FLOP_WX_SCOUT_MAX_DB_BYTES=1073741824
 export FLOP_WX_BENCH_REPO=~/dev/flop_bench
 export FLOP_WX_BENCH_ALLOW_LOCAL_EXEC=false   # default; do not enable casually
 export FLOP_WX_ROUTER_REPO=~/dev/flop-router
@@ -184,16 +190,15 @@ If a local backend is missing, the adapter raises `AdapterError` instead of
 returning stub success labeled as live. `doctor` and `live-demo` now read
 `--config` (YAML/JSON/TOML) the same way as other commands.
 
-Scout CLI contract (tried first; Scout v0.3.3 does not yet implement `feed`):
+Scout CLI contract (tried after JSONL / projection; Scout v0.3.3 does not yet implement `feed`):
 
 ```bash
 python flop_scout.py evidence feed --since-id 0 --format jsonl
 ```
 
-Local fallback: read-only `evidence_records` in `observer.sqlite`, grouped by
-DID and ranked by evidence count. Output is capped (default 25; never dump the
-warehouse into demo/CLI stdout). Scout `observe` / `read` / `say` are never
-invoked (those use the network).
+**Scout source preference:** configured evidence JSONL, then a Scout projection DB ≤1GiB (`scout_projection_db`, or `scout_projection.sqlite` / `projection.sqlite` under `scout_state_dir`), then the timed evidence-feed CLI, then a small observer sqlite. Raw `observer.sqlite` warehouses (~48–52GiB) are **not** queried: `doctor` reports `warehouse.oversized` / `risky`, and `find_candidates` fails closed within `scout_sqlite_timeout_seconds` (default 5s) so `live-demo` can fall back to the stub. `GROUP BY did` over the full warehouse would hang even with `LIMIT 25`.
+
+Local sqlite fallback (small DBs only): read-only `evidence_records`, grouped by DID and ranked by evidence count. Output is capped (default 25; never dump the warehouse into demo/CLI stdout). Scout `observe` / `read` / `say` are never invoked (those use the network).
 
 Router CLI contract (`--db` is a parent-parser flag, before `decision`):
 
